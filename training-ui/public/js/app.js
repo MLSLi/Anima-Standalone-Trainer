@@ -52,6 +52,11 @@ async function api(url, opts = {}) {
         ...opts,
         body: opts.body ? JSON.stringify(opts.body) : undefined
     });
+    if (!res.ok) {
+        let msg = res.statusText;
+        try { const err = await res.json(); msg = err.error || msg; } catch (_) { }
+        throw new Error(msg);
+    }
     return res.json();
 }
 
@@ -125,49 +130,59 @@ async function selectJob(name) {
     isDirty = false;
 
     currentJob = name;
+    if (samplesPollTimer) { clearInterval(samplesPollTimer); samplesPollTimer = null; }
     localStorage.setItem('lastJob', name);
     jobTitle.textContent = name;
     emptyState.classList.add('hidden');
     jobEditor.classList.remove('hidden');
 
-    // Load available GPUs
-    await loadGPUs();
+    try {
+        // Load available GPUs
+        await loadGPUs();
 
-    // Load job data
-    const data = await api(`/api/jobs/${name}`);
-    populateConfig(data.config);
-    populateDataset(data.dataset);
+        // Load job data
+        const data = await api(`/api/jobs/${name}`);
+        populateConfig(data.config);
+        populateDataset(data.dataset);
 
-    // Load prompts
-    await loadPrompts();
+        // Load prompts
+        await loadPrompts();
 
-    // Check run status
-    const status = await api(`/api/jobs/${name}/train/status`);
-    updateRunningState(status.running);
+        // Check run status
+        const status = await api(`/api/jobs/${name}/train/status`);
+        updateRunningState(status.running);
 
-    // Save initial state for dirty checking
-    lastSavedConfig = JSON.parse(JSON.stringify(gatherConfig()));
-    lastSavedDataset = JSON.parse(JSON.stringify(gatherDataset()));
-    lastSavedPrompts = JSON.parse(JSON.stringify(currentPrompts));
+        // Save initial state for dirty checking
+        lastSavedConfig = JSON.parse(JSON.stringify(gatherConfig()));
+        lastSavedDataset = JSON.parse(JSON.stringify(gatherDataset()));
+        lastSavedPrompts = JSON.parse(JSON.stringify(currentPrompts));
 
 
-    // Subscribe WS
-    subscribeToJob(name);
+        // Subscribe WS
+        subscribeToJob(name);
 
-    // Reset console
-    consoleOutput.textContent = 'Waiting for training to start...';
+        // Reset console
+        consoleOutput.textContent = 'Waiting for training to start...';
 
-    // Reset save button
-    $('btn-save').classList.add('hidden');
-    $('btn-discard').classList.add('hidden');
+        // Reset save button
+        $('btn-save').classList.add('hidden');
+        $('btn-discard').classList.add('hidden');
 
-    // Refresh job list highlight
-    loadJobs();
+        // Refresh job list highlight
+        loadJobs();
 
-    // Load samples
-    loadSamples();
-    loadCheckpoints();
-    loadPromptTransientSettings();
+        // Load samples
+        loadSamples();
+        loadCheckpoints();
+        loadPromptTransientSettings();
+    } catch (err) {
+        console.error(`Failed to load job "${name}":`, err);
+        showToast(`Failed to load job: ${err.message}`, 'danger');
+        currentJob = null;
+        localStorage.removeItem('lastJob');
+        jobEditor.classList.add('hidden');
+        emptyState.classList.remove('hidden');
+    }
 }
 
 function updateRunningState(running) {
@@ -750,7 +765,9 @@ function appendConsole(text) {
 
 async function loadCheckpoints() {
     if (!currentJob) return;
+    const jobAtStart = currentJob;
     const files = await api(`/api/jobs/${currentJob}/checkpoints`);
+    if (currentJob !== jobAtStart) return; // job changed while fetching
     const select = $('gen-lora-select');
 
     // Save current selection
@@ -923,8 +940,8 @@ function createSampleCard(img, container) {
     }
 
     card.innerHTML = `
-        <img src="${img.path}" alt="${img.name}" loading="lazy" draggable="false">
-        <div class="sample-name">${img.name}</div>
+        <img src="${img.path}" alt="${escapeHTML(img.name)}" loading="lazy" draggable="false">
+        <div class="sample-name">${escapeHTML(img.name)}</div>
         <button class="btn-delete-card" title="Delete Image">✕</button>
     `;
 
