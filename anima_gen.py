@@ -17,6 +17,26 @@ CACHED_MODELS = None
 APP_ACCELERATOR = None
 CURRENT_LORA = {"path": None, "mul": 1.0}
 
+def _apply_lora(accelerator, models, lora_path, multiplier):
+    import networks.lora_anima
+    net, sd = networks.lora_anima.create_network_from_weights(
+        multiplier=multiplier, 
+        file=lora_path,
+        ae=models["vae"],
+        text_encoders=[models["qwen3"]],
+        unet=models["dit"],
+        for_inference=True
+    )
+    net.merge_to([models["qwen3"]], models["dit"], sd, models["dtype"], accelerator.device)
+    
+    # Sync with secondary model if using Parallel CFG
+    if models.get("dit_secondary") is not None:
+        sec_device = next(models["dit_secondary"].parameters()).device
+        net.merge_to([], models["dit_secondary"], sd, models["dtype"], sec_device)
+        
+    del net, sd
+    torch.cuda.empty_cache()
+
 def manage_lora(accelerator, models, target_path, target_mul):
     global CURRENT_LORA
     
@@ -24,24 +44,11 @@ def manage_lora(accelerator, models, target_path, target_mul):
     if CURRENT_LORA["path"] == target_path and abs(CURRENT_LORA["mul"] - target_mul) < 1e-6:
         return # No change
         
-    import networks.lora_anima
-    
     # Unmerge current if exists
     if CURRENT_LORA["path"]:
         logger.info(f"Unmerging previous LoRA: {CURRENT_LORA['path']}")
         try:
-            # Create network with negative multiplier to subtract
-            net, sd = networks.lora_anima.create_network_from_weights(
-                multiplier=-CURRENT_LORA["mul"], 
-                file=CURRENT_LORA["path"],
-                ae=models["vae"],
-                text_encoders=[models["qwen3"]],
-                unet=models["dit"],
-                for_inference=True
-            )
-            net.merge_to([models["qwen3"]], models["dit"], sd, models["dtype"], accelerator.device)
-            del net, sd, 
-            torch.cuda.empty_cache()
+            _apply_lora(accelerator, models, CURRENT_LORA["path"], -CURRENT_LORA["mul"])
             CURRENT_LORA["path"] = None
         except Exception as e:
             logger.error(f"Failed to unmerge LoRA: {e}")
@@ -50,17 +57,7 @@ def manage_lora(accelerator, models, target_path, target_mul):
     if target_path:
         logger.info(f"Merging new LoRA: {target_path} (x{target_mul})")
         try:
-            net, sd = networks.lora_anima.create_network_from_weights(
-                multiplier=target_mul,
-                file=target_path,
-                ae=models["vae"],
-                text_encoders=[models["qwen3"]],
-                unet=models["dit"],
-                for_inference=True
-            )
-            net.merge_to([models["qwen3"]], models["dit"], sd, models["dtype"], accelerator.device)
-            del net, sd
-            torch.cuda.empty_cache()
+            _apply_lora(accelerator, models, target_path, target_mul)
             CURRENT_LORA["path"] = target_path
             CURRENT_LORA["mul"] = target_mul
         except Exception as e:
@@ -123,14 +120,102 @@ def load_models(args, accelerator):
         CURRENT_LORA["path"] = args.network_weights
         CURRENT_LORA["mul"] = args.network_mul
 
-    # Move to GPU
-    dit.to(accelerator.device)
-    qwen3_text_encoder.to(accelerator.device)
-    vae.to(accelerator.device)
-    vae_scale = [t.to(accelerator.device) for t in vae_scale]
+    # Move to GPU (or distribute across GPUs)
+    dit_secondary = None
+    if args.device_map == 'parallel_cfg' and torch.cuda.device_count() > 1:
+        # Parallel CFG: full model on each GPU for simultaneous pos/neg inference
+        import copy
+        logger.info("Parallel CFG mode: loading model on both GPUs")
+        dit.to(torch.device('cuda:0'))
+        logger.info("  Primary model on GPU 0")
+        
+        dit_secondary = copy.deepcopy(dit)
+        dit_secondary.to(torch.device('cuda:1'))
+        logger.info("  Secondary model (deepcopy) on GPU 1")
+        
+        qwen3_text_encoder.to(torch.device('cuda:0'))
+        vae.to(torch.device('cuda:0'))
+        vae_scale = [t.to(torch.device('cuda:0')) for t in vae_scale]
+    elif args.device_map == 'sharding' and torch.cuda.device_count() > 1:
+        # Multi-GPU model sharding: distribute DiT blocks across GPUs
+        num_gpus = torch.cuda.device_count()
+        logger.info(f"Multi-GPU sharding: distributing model across {num_gpus} GPUs")
+        
+        # Get VRAM for each GPU to split proportionally
+        vram = []
+        for i in range(num_gpus):
+            total_mem = torch.cuda.get_device_properties(i).total_memory
+            vram.append(total_mem)
+            logger.info(f"  GPU {i}: {torch.cuda.get_device_properties(i).name} ({total_mem / 1e9:.1f} GB)")
+        
+        total_vram = sum(vram)
+        num_blocks = len(dit.blocks)
+        
+        # Split blocks proportionally by VRAM
+        gpu_assignments = []
+        blocks_assigned = 0
+        for i in range(num_gpus):
+            if i == num_gpus - 1:
+                n = num_blocks - blocks_assigned
+            else:
+                n = round(num_blocks * vram[i] / total_vram)
+            gpu_assignments.append(n)
+            blocks_assigned += n
+        
+        # Move components to their assigned GPUs
+        first_gpu = torch.device('cuda:0')
+        last_gpu = torch.device(f'cuda:{num_gpus - 1}')
+        
+        # Embeddings on first GPU, final layer on last GPU
+        dit.x_embedder.to(first_gpu)
+        dit.t_embedder.to(first_gpu)
+        dit.t_embedding_norm.to(first_gpu)
+        if hasattr(dit, 'pos_embedder'):
+            dit.pos_embedder.to(first_gpu)
+        if hasattr(dit, 'extra_pos_embedder'):
+            dit.extra_pos_embedder.to(first_gpu)
+        if hasattr(dit, 'llm_adapter'):
+            dit.llm_adapter.to(first_gpu)
+        dit.final_layer.to(last_gpu)
+        
+        # Distribute blocks across GPUs
+        block_idx = 0
+        for gpu_id in range(num_gpus):
+            device = torch.device(f'cuda:{gpu_id}')
+            n_blocks = gpu_assignments[gpu_id]
+            for _ in range(n_blocks):
+                dit.blocks[block_idx].to(device)
+                block_idx += 1
+            logger.info(f"  GPU {gpu_id}: {n_blocks} blocks")
+        
+        # Mark model as sharded so forward() knows to move tensors between devices
+        dit._is_multi_gpu_sharded = True
+
+        # Text encoder on first GPU, VAE on last GPU
+        qwen3_text_encoder.to(first_gpu)
+        vae.to(last_gpu)
+        vae_scale = [t.to(last_gpu) for t in vae_scale]
+    else:
+        dit.to(accelerator.device)
+        qwen3_text_encoder.to(accelerator.device)
+        vae.to(accelerator.device)
+        vae_scale = [t.to(accelerator.device) for t in vae_scale]
+
+    # Enable specialized attention if requested
+    if hasattr(args, 'flash_attn') and args.flash_attn:
+        logger.info("Enabling Flash Attention for inference")
+        dit.set_flash_attn(True)
+        if dit_secondary is not None:
+            dit_secondary.set_flash_attn(True)
+    elif hasattr(args, 'sage_attn') and args.sage_attn:
+        logger.info("Enabling SageAttention for inference")
+        dit.set_sage_attn(True)
+        if dit_secondary is not None:
+            dit_secondary.set_sage_attn(True)
 
     return {
         "dit": dit,
+        "dit_secondary": dit_secondary,
         "qwen3": qwen3_text_encoder,
         "vae": vae,
         "vae_scale": vae_scale,
@@ -155,7 +240,8 @@ def perform_generation(args, models, accelerator):
         models["vae_scale"],
         models["qwen3"], 
         models["tokenize_strategy"], 
-        models["text_encoding_strategy"]
+        models["text_encoding_strategy"],
+        dit_secondary=models.get("dit_secondary"),
     )
     logger.info("Generation finished.")
 
@@ -173,27 +259,46 @@ def run_server(args, accelerator):
     CACHED_MODELS = load_models(args, accelerator)
     logger.info("Models loaded. Server ready.")
 
+    import threading
+    gen_lock = threading.Lock()
+
     @app.route('/generate', methods=['POST'])
     def handle_generate():
-        try:
-            data = request.json
-            if 'sample_prompts' in data:
-                args.sample_prompts = data['sample_prompts']
-            
-            if 'flow_shift' in data:
-                args.flow_shift = float(data['flow_shift'])
-            
-            # Handle Dynamic LoRA Switching
-            req_weights = data.get('network_weights')
-            req_mul = float(data.get('network_mul', 1.0))
-            
-            manage_lora(accelerator, CACHED_MODELS, req_weights, req_mul)
+        if gen_lock.locked():
+            return jsonify({"success": False, "error": "Generation already in progress. Please wait."}), 429
 
-            perform_generation(args, CACHED_MODELS, accelerator)
-            return jsonify({"success": True})
-        except Exception as e:
-            logger.error(f"Generation failed: {e}")
-            return jsonify({"success": False, "error": str(e)}), 500
+        with gen_lock:
+            try:
+                data = request.json
+                if 'sample_prompts' in data:
+                    args.sample_prompts = data['sample_prompts']
+                
+                if 'flow_shift' in data:
+                    args.flow_shift = float(data['flow_shift'])
+                
+                # Handle Dynamic LoRA Switching
+                req_weights = data.get('network_weights')
+                req_mul = float(data.get('network_mul', 1.0))
+                
+                manage_lora(accelerator, CACHED_MODELS, req_weights, req_mul)
+
+                # Handle Dynamic Attention Switching
+                req_flash = bool(data.get('flash_attn', False))
+                req_sage = bool(data.get('sage_attn', False))
+                
+                if 'dit' in CACHED_MODELS:
+                    CACHED_MODELS['dit'].set_flash_attn(req_flash)
+                    CACHED_MODELS['dit'].set_sage_attn(req_sage)
+                if CACHED_MODELS.get('dit_secondary') is not None:
+                    CACHED_MODELS['dit_secondary'].set_flash_attn(req_flash)
+                    CACHED_MODELS['dit_secondary'].set_sage_attn(req_sage)
+
+                perform_generation(args, CACHED_MODELS, accelerator)
+                return jsonify({"success": True})
+            except Exception as e:
+                import traceback
+                logger.error(f"Generation failed: {e}\n{traceback.format_exc()}")
+                return jsonify({"success": False, "error": str(e)}), 500
 
     @app.route('/ping', methods=['GET'])
     def ping():
@@ -231,13 +336,36 @@ def main():
     parser.add_argument("--sample_every_n_epochs", type=int, default=None)
     parser.add_argument("--network_weights", type=str, default=None, help="Path to LoRA weights")
     parser.add_argument("--network_mul", type=float, default=1.0, help="LoRA multiplier")
+    parser.add_argument("--device_map", type=str, default=None, help="Device map for model sharding (sharding = split across GPUs)")
     
+    parser.add_argument("--sage_attn", action="store_true", help="Use SageAttention for inference (requires sageattention package)")
     parser.add_argument("--server_port", type=int, default=None, help="Run in server mode on this port")
 
     args = parser.parse_args()
     
     # Force sample_at_first to True for this script
     args.sample_at_first = True
+
+    # Manual distributed initialization for Multi-GPU
+    if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
+        import torch.distributed as dist
+        if not dist.is_initialized():
+            os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
+            os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "29500")
+            
+            rank = int(os.environ.get("RANK", "0"))
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+            
+            if os.name == "nt":
+                # Windows: use gloo and disable libuv for better stability
+                os.environ["USE_LIBUV"] = "0"
+                backend = "gloo"
+            else:
+                # Linux: use nccl for better performance
+                backend = "nccl"
+                
+            logger.info(f"Initializing distributed process group (backend={backend}, rank={rank}, world_size={world_size})")
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
 
     accelerator = Accelerator(mixed_precision=args.mixed_precision)
     

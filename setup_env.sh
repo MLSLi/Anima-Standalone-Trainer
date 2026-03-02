@@ -21,14 +21,43 @@ fi
 echo "Node.js detected."
 echo ""
 
+# Detect Python
+if command -v python3 &> /dev/null; then
+    PYTHON_CMD=python3
+elif command -v python &> /dev/null; then
+    PYTHON_CMD=python
+else
+    echo ""
+    echo "[ERROR] Python is not installed!"
+    echo "Please install Python 3.10 or newer."
+    echo ""
+    exit 1
+fi
+
+echo "Using $PYTHON_CMD..."
+
 if [ ! -d "venv" ]; then
     echo "Creating venv..."
-    python3 -m venv venv
+    $PYTHON_CMD -m venv venv
+    if [ $? -ne 0 ]; then
+        echo ""
+        echo "[ERROR] Failed to create virtual environment."
+        echo ""
+        exit 1
+    fi
 else
     echo "Venv already exists."
 fi
 
-source venv/bin/activate
+# Activate venv
+if [ -f "venv/bin/activate" ]; then
+    source venv/bin/activate
+else
+    echo ""
+    echo "[ERROR] venv/bin/activate not found!"
+    echo ""
+    exit 1
+fi
 
 echo "----------------------------------------------------------------------"
 echo "Installing requirements from requirements.txt..."

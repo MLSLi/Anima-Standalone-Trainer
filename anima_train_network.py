@@ -83,7 +83,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 args.blocks_to_swap is None or args.blocks_to_swap == 0
             ), "blocks_to_swap is not supported with unsloth_offload_checkpointing"
 
-        # Flash attention: validate availability
+        # Attention: validate availability
         if getattr(args, 'flash_attn', False):
             try:
                 import flash_attn  # noqa: F401
@@ -91,7 +91,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             except ImportError:
                 logger.warning("flash_attn package not installed, falling back to PyTorch SDPA")
                 args.flash_attn = False
-
+                
         if getattr(args, 'blockwise_fused_optimizers', False):
             raise ValueError("blockwise_fused_optimizers is not supported with LoRA/NetworkTrainer")
 
@@ -129,7 +129,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             disable_mmap=getattr(args, 'disable_mmap_load_safetensors', False),
         )
 
-        # Flash attention
+        # Attention backend
         if getattr(args, 'flash_attn', False):
             dit.set_flash_attn(True)
 

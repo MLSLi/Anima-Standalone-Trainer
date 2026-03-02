@@ -131,16 +131,51 @@ except ImportError:
     _flash_attn_func = None
     FLASH_ATTN_AVAILABLE = False
 
+# SageAttention support
+try:
+    from sageattention import sageattn as _sage_attn_func
+    SAGE_ATTN_AVAILABLE = True
+except ImportError:
+    _sage_attn_func = None
+    SAGE_ATTN_AVAILABLE = False
+
+
+def sage_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H_D: torch.Tensor) -> torch.Tensor:
+    """Computes multi-head attention using SageAttention.
+    
+    Input format: (batch, seq_len, n_heads, head_dim)
+    Output format: (batch, seq_len, n_heads * head_dim)
+    """
+    # SageAttention expects HND layout: (batch, n_heads, seq_len, head_dim)
+    q = q_B_S_H_D.permute(0, 2, 1, 3).contiguous()
+    k = k_B_S_H_D.permute(0, 2, 1, 3).contiguous()
+    v = v_B_S_H_D.permute(0, 2, 1, 3).contiguous()
+    
+    softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    
+    # Run SageAttention
+    out = _sage_attn_func(q, k, v, tensor_layout="HND", is_causal=False, sm_scale=softmax_scale)
+    
+    # Reshape back to (batch, seq_len, n_heads, head_dim)
+    out = out.permute(0, 2, 1, 3)
+    return rearrange(out, "b s h d -> b s (h d)")
+
 
 def flash_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H_D: torch.Tensor) -> torch.Tensor:
-    """Computes multi-head attention using Flash Attention.
+    """Computes multi-head attention using Flash Attention, with automatic fallback ONLY on missing kernel.
 
     Input format: (batch, seq_len, n_heads, head_dim)
     Output format: (batch, seq_len, n_heads * head_dim) — matches torch_attention_op output.
     """
-    # flash_attn_func expects (B, S, H, D) and returns (B, S, H, D)
-    out = _flash_attn_func(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D)
-    return rearrange(out, "b s h d -> b s (h d)")
+    try:
+        # Try Flash Attention 2
+        out = _flash_attn_func(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D)
+        return rearrange(out, "b s h d -> b s (h d)")
+    except RuntimeError as e:
+        # Robust fallback if the Flash Attention kernel image is missing for this specific GPU
+        if "no kernel image is available" in str(e):
+            return torch_attention_op(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D)
+        raise e
 
 
 from .utils import setup_logging
@@ -1101,6 +1136,9 @@ class MiniTrainDIT(nn.Module):
         self.blocks_to_swap = None
         self.offloader: Optional[custom_offloading_utils.ModelOffloader] = None
 
+        # Multi-GPU sharding flag: set True only when blocks are distributed across GPUs
+        self._is_multi_gpu_sharded = False
+
         self.build_patch_embed()
         self.build_pos_embed()
         self.use_adaln_lora = use_adaln_lora
@@ -1171,13 +1209,19 @@ class MiniTrainDIT(nn.Module):
 
 
     def set_flash_attn(self, use_flash_attn: bool):
-        """Toggle flash attention for all DiT blocks (self-attn + cross-attn).
-
-        LLM Adapter attention is NOT affected (it uses attention masks incompatible with flash_attn).
-        """
+        """Toggle flash attention for all DiT blocks."""
         if use_flash_attn and not FLASH_ATTN_AVAILABLE:
             raise ImportError("flash_attn package is required for --flash_attn but is not installed")
         attn_op = flash_attention_op if use_flash_attn else torch_attention_op
+        for block in self.blocks:
+            block.self_attn.attn_op = attn_op
+            block.cross_attn.attn_op = attn_op
+
+    def set_sage_attn(self, use_sage_attn: bool):
+        """Toggle sage attention for all DiT blocks."""
+        if use_sage_attn and not SAGE_ATTN_AVAILABLE:
+            raise ImportError("sageattention package is required for --sage_attn but is not installed")
+        attn_op = sage_attention_op if use_sage_attn else torch_attention_op
         for block in self.blocks:
             block.self_attn.attn_op = attn_op
             block.cross_attn.attn_op = attn_op
@@ -1341,6 +1385,20 @@ class MiniTrainDIT(nn.Module):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_idx)
 
+            # Multi-GPU sharding: move tensors to block's device if needed
+            if self._is_multi_gpu_sharded:
+                block_device = next(block.parameters()).device
+                if x_B_T_H_W_D.device != block_device:
+                    x_B_T_H_W_D = x_B_T_H_W_D.to(block_device)
+                    t_embedding_B_T_D = t_embedding_B_T_D.to(block_device)
+                    crossattn_emb = crossattn_emb.to(block_device)
+                    if block_kwargs["rope_emb_L_1_1_D"] is not None:
+                        block_kwargs["rope_emb_L_1_1_D"] = block_kwargs["rope_emb_L_1_1_D"].to(block_device)
+                    if block_kwargs["adaln_lora_B_T_3D"] is not None:
+                        block_kwargs["adaln_lora_B_T_3D"] = block_kwargs["adaln_lora_B_T_3D"].to(block_device)
+                    if block_kwargs["extra_per_block_pos_emb"] is not None:
+                        block_kwargs["extra_per_block_pos_emb"] = block_kwargs["extra_per_block_pos_emb"].to(block_device)
+
             x_B_T_H_W_D = block(
                 x_B_T_H_W_D,
                 t_embedding_B_T_D,
@@ -1350,6 +1408,16 @@ class MiniTrainDIT(nn.Module):
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks(self.blocks, block_idx)
+
+        # Move to final layer device if needed (multi-GPU sharding only)
+        if self._is_multi_gpu_sharded:
+            final_device = next(self.final_layer.parameters()).device
+            if x_B_T_H_W_D.device != final_device:
+                x_B_T_H_W_D = x_B_T_H_W_D.to(final_device)
+            if t_embedding_B_T_D.device != final_device:
+                t_embedding_B_T_D = t_embedding_B_T_D.to(final_device)
+            if adaln_lora_B_T_3D is not None and adaln_lora_B_T_3D.device != final_device:
+                adaln_lora_B_T_3D = adaln_lora_B_T_3D.to(final_device)
 
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)

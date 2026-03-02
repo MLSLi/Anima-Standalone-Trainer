@@ -142,6 +142,7 @@ async function selectJob(name) {
     try {
         // Load available GPUs
         await loadGPUs();
+        await loadGenGPUs();
 
         // Load job data
         const data = await api(`/api/jobs/${name}`);
@@ -750,13 +751,17 @@ function savePromptTransientSettings() {
     const settings = {
         lora_mul: $('gen-lora-mul').value,
         keep_loaded: $('chk-keep-loaded').checked,
+        flash_attn: $('gen-flash-attn').checked,
+        sage_attn: $('gen-sage-attn').checked,
         global_w: $('global-w').value,
         global_h: $('global-h').value,
         global_s: $('global-s').value,
         global_l: $('global-l').value,
         global_d: $('global-d').value,
         selected_lora: $('gen-lora-select').value,
-        negative_prompt: $('global-negative-prompt').value
+        negative_prompt: $('global-negative-prompt').value,
+        gen_gpu_ids: getSelectedGenGPUs(),
+        gen_multi_gpu_mode: $('gen-multi-gpu-mode').value
     };
     localStorage.setItem(`prompt_transient_${currentJob}`, JSON.stringify(settings));
 }
@@ -770,12 +775,21 @@ function loadPromptTransientSettings() {
         const settings = JSON.parse(data);
         if (settings.lora_mul !== undefined) $('gen-lora-mul').value = settings.lora_mul;
         if (settings.keep_loaded !== undefined) $('chk-keep-loaded').checked = settings.keep_loaded;
+        if (settings.flash_attn !== undefined) $('gen-flash-attn').checked = settings.flash_attn;
+        if (settings.sage_attn !== undefined) $('gen-sage-attn').checked = settings.sage_attn;
         if (settings.global_w !== undefined) $('global-w').value = settings.global_w;
         if (settings.global_h !== undefined) $('global-h').value = settings.global_h;
         if (settings.global_s !== undefined) $('global-s').value = settings.global_s;
         if (settings.global_l !== undefined) $('global-l').value = settings.global_l;
         if (settings.global_d !== undefined) $('global-d').value = settings.global_d;
         if (settings.negative_prompt !== undefined) $('global-negative-prompt').value = settings.negative_prompt;
+        // Restore gen GPU selection
+        if (settings.gen_gpu_ids !== undefined) {
+            restoreGenGPUSelection(settings.gen_gpu_ids);
+        }
+        if (settings.gen_multi_gpu_mode !== undefined) {
+            $('gen-multi-gpu-mode').value = settings.gen_multi_gpu_mode;
+        }
         // selected_lora is handled in loadCheckpoints
     } catch (e) { }
 }
@@ -2054,6 +2068,86 @@ async function loadGPUs() {
     }
 }
 
+// Load GPUs for generation (separate from training GPU selection)
+async function loadGenGPUs() {
+    const container = $('gen-gpu-selection');
+    if (!container) return;
+    try {
+        const gpus = await api('/api/system/gpus');
+        container.innerHTML = '';
+
+        if (gpus.length === 0) {
+            container.innerHTML = '<small>No NVIDIA GPUs detected.</small>';
+            return;
+        }
+
+        gpus.forEach((gpu, i) => {
+            const card = document.createElement('div');
+            card.className = 'gpu-card' + (i === 0 ? ' selected' : '');
+            card.dataset.index = gpu.index;
+            card.id = `gen-gpu-card-${gpu.index}`;
+
+            card.innerHTML = `
+                <div class="gpu-index">GPU ${gpu.index}</div>
+                <div class="gpu-name" title="${gpu.name}">${gpu.name}</div>
+                <div class="gpu-mem">${gpu.memory}</div>
+                <input type="checkbox" name="gen-gpu-select" value="${gpu.index}" ${i === 0 ? 'checked' : ''} id="gen-gpu-${gpu.index}">
+            `;
+
+            const cb = card.querySelector('input[type=checkbox]');
+            card.addEventListener('click', (e) => {
+                if (e.target.tagName === 'INPUT') {
+                    card.classList.toggle('selected', e.target.checked);
+                    updateGenGPULabel();
+                    return;
+                }
+                cb.checked = !cb.checked;
+                card.classList.toggle('selected', cb.checked);
+                updateGenGPULabel();
+            });
+
+            container.appendChild(card);
+        });
+
+        updateGenGPULabel();
+    } catch (err) {
+        console.error('Failed to load gen GPUs:', err);
+        container.innerHTML = `<small style="color:red">Error: ${err.message}</small>`;
+    }
+}
+
+function getSelectedGenGPUs() {
+    const checked = document.querySelectorAll('input[name="gen-gpu-select"]:checked');
+    return Array.from(checked).map(c => c.value).join(',');
+}
+
+function restoreGenGPUSelection(gpuIds) {
+    if (!gpuIds) return;
+    const ids = gpuIds.split(',').map(s => s.trim());
+    document.querySelectorAll('input[name="gen-gpu-select"]').forEach(cb => {
+        cb.checked = ids.includes(cb.value);
+        const card = cb.closest('.gpu-card');
+        if (card) card.classList.toggle('selected', cb.checked);
+    });
+    updateGenGPULabel();
+}
+
+function updateGenGPULabel() {
+    const label = $('gen-gpu-mode-label');
+    const optionsDiv = $('gen-multi-gpu-options');
+    if (!label) return;
+    const selected = document.querySelectorAll('input[name="gen-gpu-select"]:checked');
+    if (selected.length > 1) {
+        label.textContent = '— Multi-GPU';
+        label.style.color = 'var(--success)';
+        if (optionsDiv) optionsDiv.style.display = 'block';
+    } else {
+        label.textContent = '';
+        label.style.color = '';
+        if (optionsDiv) optionsDiv.style.display = 'none';
+    }
+}
+
 async function updateGPUActivity() {
     try {
         const res = await fetch('/api/gpu/activity');
@@ -2225,6 +2319,10 @@ $('btn-gen-sample').addEventListener('click', async () => {
     }
     // Add Anima generation params
     payload.flow_shift = parseFloat($('cfg-flow-shift').value) || 3.0;
+    payload.flash_attn = $('gen-flash-attn').checked;
+    payload.sage_attn = $('gen-sage-attn').checked;
+    payload.gen_gpu_ids = getSelectedGenGPUs();
+    payload.gen_multi_gpu_mode = $('gen-multi-gpu-mode').value;
 
     const result = await api(`/api/jobs/${currentJob}/generate`, {
         method: 'POST',
@@ -2305,7 +2403,7 @@ $('btn-add-prompt').addEventListener('click', addPrompt);
 $('btn-apply-global').addEventListener('click', applyGlobalSettings);
 
 // Persistence for Prompt Tab settings
-['gen-lora-select', 'gen-lora-mul', 'chk-keep-loaded', 'global-w', 'global-h', 'global-s', 'global-l', 'global-d'].forEach(id => {
+['gen-lora-select', 'gen-lora-mul', 'chk-keep-loaded', 'gen-flash-attn', 'gen-multi-gpu-mode', 'global-w', 'global-h', 'global-s', 'global-l', 'global-d'].forEach(id => {
     $(id).addEventListener('change', savePromptTransientSettings);
     if ($(id).tagName === 'INPUT') {
         $(id).addEventListener('input', savePromptTransientSettings);
@@ -2400,6 +2498,22 @@ async function init() {
 
     // Discard Button
     $('btn-discard').addEventListener('click', discardChanges);
+
+    // Mutual exclusivity for Flash/Sage Attention
+    const enforceMutualAttention = (flashId, sageId) => {
+        const flash = $(flashId);
+        const sage = $(sageId);
+        if (!flash || !sage) return;
+        flash.addEventListener('change', () => {
+            if (flash.checked) sage.checked = false;
+            if (flashId.startsWith('gen-')) savePromptTransientSettings();
+        });
+        sage.addEventListener('change', () => {
+            if (sage.checked) flash.checked = false;
+            if (flashId.startsWith('gen-')) savePromptTransientSettings();
+        });
+    };
+    enforceMutualAttention('gen-flash-attn', 'gen-sage-attn');
 
 
     // Restore Job

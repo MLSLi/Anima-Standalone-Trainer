@@ -713,6 +713,52 @@ function killProcess(pid) {
     });
 }
 
+// --- Cross-platform venv/spawn helpers ---
+
+const isWindows = process.platform === 'win32';
+
+function getVenvPaths(venvPath) {
+    if (isWindows) {
+        return {
+            activate: path.join(venvPath, 'Scripts', 'Activate.ps1'),
+            accelerate: path.join(venvPath, 'Scripts', 'accelerate.exe'),
+            python: path.join(venvPath, 'Scripts', 'python.exe'),
+        };
+    } else {
+        return {
+            activate: path.join(venvPath, 'bin', 'activate'),
+            accelerate: path.join(venvPath, 'bin', 'accelerate'),
+            python: path.join(venvPath, 'bin', 'python'),
+        };
+    }
+}
+
+function buildEnvVar(name, value) {
+    return isWindows ? `$env:${name}='${value}';` : `export ${name}='${value}';`;
+}
+
+function buildShellScript(activatePath, envVars, command) {
+    if (isWindows) {
+        return `& "${activatePath}";\n${envVars}\n${command}`;
+    } else {
+        return `source "${activatePath}"\n${envVars}\n${command}`;
+    }
+}
+
+function spawnShell(script, cwd) {
+    if (isWindows) {
+        return spawn('powershell', ['-NoProfile', '-Command', script], {
+            cwd,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+    } else {
+        return spawn('bash', ['-c', script], {
+            cwd,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+    }
+}
+
 function killPersistentGen() {
     if (persistentGenProcess) {
         console.log(`Stop persistent gen server (PID: ${persistentGenProcess.process.pid})`);
@@ -836,8 +882,7 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
 
         const globalConfig = getGlobalConfig();
         const venvPath = globalConfig.venv_path || path.join(ROOT_DIR, 'venv');
-        const activateScript = path.join(venvPath, 'Scripts', 'Activate.ps1');
-        const acceleratePath = path.join(venvPath, 'Scripts', 'accelerate.exe');
+        const venv = getVenvPaths(venvPath);
         const genScript = path.join(ROOT_DIR, 'anima_gen.py');
 
         // Extract args
@@ -845,25 +890,20 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
         const tArgs = mergedConfig.training_arguments;
         const aArgs = mergedConfig.anima_arguments || {};
 
-        // Read config to check for GPU IDs
+        // Read config to check for GPU IDs - prefer gen-specific GPU selection
         let gpuEnv = '';
-        let currentGpuIds = '';
-        try {
-            const rawConfig = TOML.parse(fs.readFileSync(configPath, 'utf8'));
-            currentGpuIds = rawConfig.gpu_ids ? rawConfig.gpu_ids.toString().trim() : '';
-            const gpuIds = currentGpuIds;
+        const genGpuIds = req.body.gen_gpu_ids || '';
+        const rawConfig = TOML.parse(fs.readFileSync(configPath, 'utf8'));
+        const configGpuIds = rawConfig.gpu_ids ? rawConfig.gpu_ids.toString().trim() : '';
 
-            if (gpuIds) {
-                if (/^[\d\s,]+$/.test(gpuIds)) {
-                    const validIds = gpuIds.split(',').map(s => s.trim()).filter(s => s.length > 0);
-                    if (!validIds.some(id => isNaN(parseInt(id)))) {
-                        gpuEnv = `$env:CUDA_VISIBLE_DEVICES='${validIds.join(',')}';`;
-                        console.log(`[Gen] Using GPU isolation: ${gpuEnv}`);
-                    }
-                }
+        const currentGpuIdsRaw = genGpuIds || configGpuIds;
+        const genGpuIdsNormalized = currentGpuIdsRaw.split(',').map(s => s.trim()).filter(s => s.length > 0).sort().join(',');
+
+        if (genGpuIdsNormalized) {
+            if (/^[\d\s,]+$/.test(genGpuIdsNormalized)) {
+                gpuEnv = buildEnvVar('CUDA_VISIBLE_DEVICES', genGpuIdsNormalized);
+                console.log(`[Gen] Using GPU isolation: ${gpuEnv}`);
             }
-        } catch (err) {
-            console.warn("Failed to parse config for GPU options:", err);
         }
 
         const args = [
@@ -878,6 +918,23 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
             `--discrete_flow_shift=${aArgs.discrete_flow_shift || 3.0}`,
             `--timestep_sample_method="${aArgs.timestep_sample_method || 'logit_normal'}"`
         ];
+
+        // Attention support
+        if (req.body.flash_attn) {
+            args.push('--flash_attn');
+        } else if (req.body.sage_attn) {
+            args.push('--sage_attn');
+        }
+
+        // Multi-GPU model sharding support
+        const genGpuCount = genGpuIdsNormalized ? genGpuIdsNormalized.split(',').length : 0;
+        let genAccelerateFlags = '';
+        if (genGpuCount > 1) {
+            const multiGpuMode = req.body.gen_multi_gpu_mode || 'parallel_cfg';
+            args.push(`--device_map=${multiGpuMode}`);
+            // Force single process — both modes run one process across all GPUs
+            genAccelerateFlags = '--num_processes 1';
+        }
 
         // LoRA support
         if (req.body.network_weights) {
@@ -899,8 +956,15 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
             // Actually Anima is single model so if job changes we might need to reload. 
             // For simplicity, if current persistent process jobName != requested jobName, restart.
 
-            if (persistentGenProcess && persistentGenProcess.jobName !== jobName) {
-                console.log("Switching jobs, restarting persistent server...");
+            const multiGpuMode = req.body.gen_multi_gpu_mode || 'parallel_cfg';
+            const flashAttn = req.body.flash_attn || false;
+
+            if (persistentGenProcess && (
+                persistentGenProcess.jobName !== jobName ||
+                persistentGenProcess.gpuIds !== genGpuIdsNormalized ||
+                persistentGenProcess.multiGpuMode !== multiGpuMode
+            )) {
+                console.log("Configuration changed, restarting persistent server...");
                 killPersistentGen();
             }
 
@@ -908,19 +972,24 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
                 const port = await findAvailablePort(GEN_SERVER_PORT);
                 args.push(`--server_port=${port}`);
 
-                const psScript = `
-& "${activateScript}";
-$env:PYTHONIOENCODING='utf-8';
-${gpuEnv}
-python -m accelerate.commands.launch --num_cpu_threads_per_process 1 "${genScript}" ${args.join(' ')}
-`;
-                console.log("Starting persistent generation server...");
-                const proc = spawn('powershell', ['-NoProfile', '-Command', psScript], {
-                    cwd: ROOT_DIR,
-                    stdio: ['pipe', 'pipe', 'pipe']
-                });
+                const envVars = [
+                    buildEnvVar('PYTHONIOENCODING', 'utf-8'),
+                    buildEnvVar('LOG_LEVEL', 'DEBUG'),
+                    gpuEnv
+                ].filter(Boolean).join('\n');
+                const launchCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${genAccelerateFlags} "${genScript}" ${args.join(' ')}`;
+                const script = buildShellScript(venv.activate, envVars, launchCmd);
 
-                persistentGenProcess = { process: proc, port, jobName, gpuIds: currentGpuIds };
+                console.log("Starting persistent generation server...");
+                const proc = spawnShell(script, ROOT_DIR);
+
+                persistentGenProcess = {
+                    process: proc, port, jobName,
+                    gpuIds: genGpuIdsNormalized,
+                    multiGpuMode: multiGpuMode,
+                    flashAttn: req.body.flash_attn || false,
+                    sageAttn: req.body.sage_attn || false
+                };
 
                 // Stream output
                 const logFileName = `gen_server_${new Date().toISOString().replace(/[:.]/g, '-')}.log`;
@@ -961,7 +1030,9 @@ python -m accelerate.commands.launch --num_cpu_threads_per_process 1 "${genScrip
             const payload = {
                 sample_prompts: promptsPath,
                 network_weights: req.body.network_weights ? req.body.network_weights.replace(/^['"]+|['"]+$/g, '') : null,
-                network_mul: req.body.network_mul || 1.0
+                network_mul: req.body.network_mul || 1.0,
+                flash_attn: req.body.flash_attn || false,
+                sage_attn: req.body.sage_attn || false
             };
 
             const response = await fetch(`http://localhost:${persistentGenProcess.port}/generate`, {
@@ -987,17 +1058,14 @@ python -m accelerate.commands.launch --num_cpu_threads_per_process 1 "${genScrip
             }
 
             // Standard One-Shot Logic
-            const oneShotPsScript = `
-& "${activateScript}";
-$env:PYTHONIOENCODING='utf-8';
-${gpuEnv}
-python -m accelerate.commands.launch --num_cpu_threads_per_process 1 "${genScript}" ${args.join(' ')}
-`;
+            const oneShotEnvVars = [
+                buildEnvVar('PYTHONIOENCODING', 'utf-8'),
+                gpuEnv
+            ].filter(Boolean).join('\n');
+            const oneShotCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${genAccelerateFlags} "${genScript}" ${args.join(' ')}`;
+            const oneShotScript = buildShellScript(venv.activate, oneShotEnvVars, oneShotCmd);
 
-            const oneShotProc = spawn('powershell', ['-NoProfile', '-Command', oneShotPsScript], {
-                cwd: ROOT_DIR,
-                stdio: ['pipe', 'pipe', 'pipe']
-            });
+            const oneShotProc = spawnShell(oneShotScript, ROOT_DIR);
 
             // Write logs to file
             const oneShotLogFileName = `gen_${new Date().toISOString().replace(/[:.]/g, '-')}.log`;
@@ -1079,8 +1147,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         // Get venv path from global config
         const globalConfig = getGlobalConfig();
         const venvPath = globalConfig.venv_path || path.join(ROOT_DIR, 'venv');
-        const activateScript = path.join(venvPath, 'Scripts', 'Activate.ps1');
-        const acceleratePath = path.join(venvPath, 'Scripts', 'accelerate.exe');
+        const venv = getVenvPaths(venvPath);
 
         // Read config to check for GPU IDs
         let gpuEnv = '';
@@ -1111,7 +1178,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
                 const safeGpuString = validIds.join(',');
 
                 // Set explicit GPUs
-                gpuEnv = `$env:CUDA_VISIBLE_DEVICES='${safeGpuString}';`;
+                gpuEnv = buildEnvVar('CUDA_VISIBLE_DEVICES', safeGpuString);
 
                 if (validIds.length > 1) {
                     accelerateFlags = `--multi_gpu --num_processes ${validIds.length}`;
@@ -1125,17 +1192,14 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         }
 
         // Spawn training process
-        const psScript = `
-& "${activateScript}";
-$env:PYTHONIOENCODING='utf-8';
-${gpuEnv}
-python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${accelerateFlags} "${TRAINING_SCRIPT}" --config_file="${mergedConfigPath}"
-`;
+        const trainEnvVars = [
+            buildEnvVar('PYTHONIOENCODING', 'utf-8'),
+            gpuEnv
+        ].filter(Boolean).join('\n');
+        const trainCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${accelerateFlags} "${TRAINING_SCRIPT}" --config_file="${mergedConfigPath}"`;
+        const trainScript = buildShellScript(venv.activate, trainEnvVars, trainCmd);
 
-        const proc = spawn('powershell', ['-NoProfile', '-Command', psScript], {
-            cwd: ROOT_DIR,
-            stdio: ['pipe', 'pipe', 'pipe']
-        });
+        const proc = spawnShell(trainScript, ROOT_DIR);
 
         const logBuffer = [];
         const MAX_LOG_LINES = 5000;
@@ -1225,18 +1289,13 @@ app.post('/api/jobs/:name/tensorboard', (req, res) => {
         // Get venv path
         const globalConfig = getGlobalConfig();
         const venvPath = globalConfig.venv_path || path.join(ROOT_DIR, 'venv');
-        const activateScript = path.join(venvPath, 'Scripts', 'Activate.ps1');
+        const venv = getVenvPaths(venvPath);
 
         const port = nextTbPort++;
 
-        const psScript = `
-& "${activateScript}";
-python -m tensorboard.main --logdir="${logsDir}" --port=${port} --host=0.0.0.0
-`;
-        const proc = spawn('powershell', ['-NoProfile', '-Command', psScript], {
-            cwd: ROOT_DIR,
-            stdio: ['pipe', 'pipe', 'pipe']
-        });
+        const tbCmd = `python -m tensorboard.main --logdir="${logsDir}" --port=${port} --host=0.0.0.0`;
+        const tbScript = buildShellScript(venv.activate, '', tbCmd);
+        const proc = spawnShell(tbScript, ROOT_DIR);
 
         proc.stderr.on('data', (data) => {
             const text = data.toString();

@@ -48,12 +48,14 @@ def setup_logging(args=None, log_level=None, reset=False):
         else:
             return
 
-    # log_level can be set by the caller or by the args, the caller has priority. If not set, use INFO
+    # log_level can be set by the caller or by the args, the caller has priority. If not set, use environment variable or INFO
     if log_level is None and args is not None:
         log_level = args.console_log_level
     if log_level is None:
+        log_level = os.environ.get("LOG_LEVEL")
+    if log_level is None:
         log_level = "INFO"
-    log_level = getattr(logging, log_level)
+    log_level = getattr(logging, log_level.upper())
 
     # In multi-GPU setup, only setup logging on the main process to avoid duplicate logs
     # We check common environment variables for rank

@@ -74,7 +74,7 @@ def train(args):
     ) or not getattr(args, 'unsloth_offload_checkpointing', False), \
         "blocks_to_swap is not supported with unsloth_offload_checkpointing"
 
-    # Flash attention: validate availability
+    # Attention: validate availability
     if getattr(args, 'flash_attn', False):
         try:
             import flash_attn  # noqa: F401
@@ -82,7 +82,7 @@ def train(args):
         except ImportError:
             logger.warning("flash_attn package not installed, falling back to PyTorch SDPA")
             args.flash_attn = False
-
+            
     cache_latents = args.cache_latents
     use_dreambooth_method = args.in_json is None
 

@@ -140,8 +140,7 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--flash_attn",
         action="store_true",
-        help="Use Flash Attention for DiT self/cross-attention (requires flash-attn package). "
-        "Falls back to PyTorch SDPA if flash-attn is not installed.",
+        help="Use Flash Attention for DiT self/cross-attention (requires flash-attn package).",
     )
 
 
@@ -384,6 +383,7 @@ def do_sample(
     device: torch.device,
     guidance_scale: float = 1.0,
     neg_crossattn_emb: Optional[torch.Tensor] = None,
+    dit_secondary: Optional[anima_models.MiniTrainDIT] = None,
 ) -> torch.Tensor:
     """Generate a sample using Euler discrete sampling for rectified flow.
 
@@ -397,10 +397,14 @@ def do_sample(
         device: Compute device
         guidance_scale: CFG scale (1.0 = no guidance)
         neg_crossattn_emb: Negative cross-attention embeddings for CFG
+        dit_secondary: Optional second model on another GPU for parallel CFG
 
     Returns:
         Denoised latents
     """
+    import threading
+    import queue
+
     # Latent shape: (1, 16, 1, H/8, W/8) for single image
     latent_h = height // 8
     latent_w = width // 8
@@ -425,35 +429,120 @@ def do_sample(
     padding_mask = torch.zeros(1, 1, latent_h, latent_w, dtype=dtype, device=device)
 
     use_cfg = guidance_scale > 1.0 and neg_crossattn_emb is not None
+    use_parallel_cfg = use_cfg and dit_secondary is not None
+    has_block_swap = dit.blocks_to_swap is not None and dit.blocks_to_swap > 0
 
-    for i in tqdm(range(steps), desc="Sampling"):
-        sigma = sigmas[i]
-        t = sigma.unsqueeze(0)  # (1,)
+    # Pre-copy negative tensors to secondary GPU if using parallel CFG
+    if use_parallel_cfg:
+        sec_device = next(dit_secondary.parameters()).device
+        neg_crossattn_sec = neg_crossattn_emb.to(sec_device)
+        padding_mask_sec = padding_mask.to(sec_device)
+        logger.info(f"Parallel CFG: pos on {device}, neg on {sec_device}")
 
+        # Persistent worker queues — one pair per GPU, created once for the whole loop
+        pos_work_q: queue.Queue = queue.Queue()
+        neg_work_q: queue.Queue = queue.Queue()
+        pos_result_q: queue.Queue = queue.Queue()
+        neg_result_q: queue.Queue = queue.Queue()
+
+        def _pos_worker():
+            with torch.inference_mode():
+                while True:
+                    item = pos_work_q.get()
+                    if item is None:
+                        break
+                    inputs, kwargs = item
+                    try:
+                        res = dit(*inputs, **kwargs)
+                        pos_result_q.put(("ok", res))
+                    except Exception as e:
+                        pos_result_q.put(("err", e))
+
+        def _neg_worker():
+            with torch.inference_mode():
+                while True:
+                    item = neg_work_q.get()
+                    if item is None:
+                        break
+                    inputs, kwargs = item
+                    try:
+                        if has_block_swap:
+                            dit_secondary.prepare_block_swap_before_forward()
+                        res = dit_secondary(*inputs, **kwargs)
+                        neg_result_q.put(("ok", res))
+                    except Exception as e:
+                        neg_result_q.put(("err", e))
+
+        worker_pos = threading.Thread(target=_pos_worker, daemon=True)
+        worker_neg = threading.Thread(target=_neg_worker, daemon=True)
+        worker_pos.start()
+        worker_neg.start()
+
+    # Pre-allocate constant CFG buffers
+    if use_cfg and not use_parallel_cfg:
+        crossattn_doubled = torch.cat([crossattn_emb, neg_crossattn_emb], dim=0)
+        padding_doubled = torch.cat([padding_mask, padding_mask], dim=0)
+        x_doubled = torch.empty(2, *x.shape[1:], device=device, dtype=dtype)
+        t_doubled = torch.empty(2, device=device, dtype=dtype)
+
+    try:
+        with torch.autocast(device_type=device.type, enabled=False):
+            for i in tqdm(range(steps), desc="Sampling"):
+                sigma = sigmas[i]
+
+                if has_block_swap:
+                    dit.prepare_block_swap_before_forward()
+
+                if use_parallel_cfg:
+                    # Parallel CFG: dispatch to persistent workers, both GPUs run simultaneously
+                    t = sigma.unsqueeze(0)
+                    x_sec = x.to(sec_device)
+                    t_sec = t.to(sec_device)
+
+                    pos_work_q.put(((x, t, crossattn_emb), {"padding_mask": padding_mask}))
+                    neg_work_q.put(((x_sec, t_sec, neg_crossattn_sec), {"padding_mask": padding_mask_sec}))
+
+                    status_pos, res_pos = pos_result_q.get()
+                    status_neg, res_neg = neg_result_q.get()
+
+                    if status_pos == "err":
+                        raise res_pos
+                    if status_neg == "err":
+                        raise res_neg
+
+                    # pos is already on primary device; neg needs PCIe transfer
+                    pos_out = res_pos
+                    neg_out = res_neg.to(device)
+                    model_output = neg_out + guidance_scale * (pos_out - neg_out)
+
+                elif use_cfg:
+                    # Standard CFG: use pre-allocated doubled buffers
+                    x_doubled[0] = x[0]
+                    x_doubled[1] = x[0]
+                    t_doubled[0] = sigma
+                    t_doubled[1] = sigma
+
+                    model_output = dit(x_doubled, t_doubled, crossattn_doubled, padding_mask=padding_doubled)
+
+                    pos_out, neg_out = model_output.chunk(2)
+                    model_output = neg_out + guidance_scale * (pos_out - neg_out)
+                else:
+                    t = sigma.unsqueeze(0)
+                    model_output = dit(x, t, crossattn_emb, padding_mask=padding_mask)
+
+                # Euler step
+                dt = sigmas[i + 1] - sigma
+                x = x + model_output * dt
+
+    finally:
+        if use_parallel_cfg:
+            pos_work_q.put(None)
+            neg_work_q.put(None)
+            worker_pos.join()
+            worker_neg.join()
+
+    if has_block_swap:
         dit.prepare_block_swap_before_forward()
-
-        if use_cfg:
-            # CFG: concat positive and negative
-            x_input = torch.cat([x, x], dim=0)
-            t_input = torch.cat([t, t], dim=0)
-            crossattn_input = torch.cat([crossattn_emb, neg_crossattn_emb], dim=0)
-            padding_input = torch.cat([padding_mask, padding_mask], dim=0)
-
-            model_output = dit(x_input, t_input, crossattn_input, padding_mask=padding_input)
-            model_output = model_output.float()
-
-            pos_out, neg_out = model_output.chunk(2)
-            model_output = neg_out + guidance_scale * (pos_out - neg_out)
-        else:
-            model_output = dit(x, t, crossattn_emb, padding_mask=padding_mask)
-            model_output = model_output.float()
-
-        # Euler step: x_{t-1} = x_t - (sigma_t - sigma_{t-1}) * model_output
-        dt = sigmas[i + 1] - sigma
-        x = x + model_output * dt
-        x = x.to(dtype)
-
-    dit.prepare_block_swap_before_forward()
     return x
 
 
@@ -470,30 +559,37 @@ def sample_images(
     text_encoding_strategy,
     sample_prompts_te_outputs=None,
     prompt_replacement=None,
+    dit_secondary=None,
 ):
-    if not accelerator.is_main_process:
-        return
-        
     """Generate sample images during training.
 
-    This is a simplified sampler for Anima - it generates images using the current model state.
+    When multiple GPUs are available, prompts are distributed across all processes
+    using round-robin assignment so each GPU generates a subset in parallel.
     """
     if steps == 0:
         if not args.sample_at_first:
+            accelerator.wait_for_everyone()
             return
     else:
         if args.sample_every_n_steps is None and args.sample_every_n_epochs is None:
+            accelerator.wait_for_everyone()
             return
         if args.sample_every_n_epochs is not None:
             if epoch is None or epoch % args.sample_every_n_epochs != 0:
+                accelerator.wait_for_everyone()
                 return
         else:
             if steps % args.sample_every_n_steps != 0 or epoch is not None:
+                accelerator.wait_for_everyone()
                 return
 
-    logger.info(f"Generating sample images at step {steps}")
+    rank = accelerator.process_index
+    num_processes = accelerator.num_processes
+    logger.info(f"[GPU {rank}] Generating sample images at step {steps}")
+
     if not os.path.isfile(args.sample_prompts) and sample_prompts_te_outputs is None:
         logger.error(f"No prompt file: {args.sample_prompts}")
+        accelerator.wait_for_everyone()
         return
 
     # Unwrap models
@@ -505,6 +601,13 @@ def sample_images(
     save_dir = os.path.join(args.output_dir, "sample")
     os.makedirs(save_dir, exist_ok=True)
 
+    # Distribute prompts across GPUs using round-robin assignment
+    my_prompts = [p for i, p in enumerate(prompts) if i % num_processes == rank]
+    if my_prompts:
+        logger.info(f"[GPU {rank}] Assigned {len(my_prompts)}/{len(prompts)} prompts")
+    else:
+        logger.info(f"[GPU {rank}] No prompts assigned (fewer prompts than GPUs), waiting...")
+
     # Save RNG state
     rng_state = torch.get_rng_state()
     cuda_rng_state = None
@@ -513,23 +616,28 @@ def sample_images(
     except Exception:
         pass
 
-    # Move VAE to GPU once
-    org_vae_device = next(vae.parameters()).device
-    vae.to(accelerator.device)
-    vae_scale_gpu = [t.to(accelerator.device) for t in vae_scale]
+    if my_prompts:
+        # Move VAE to GPU once
+        org_vae_device = next(vae.parameters()).device
+        vae.to(accelerator.device)
+        vae_scale_gpu = [t.to(accelerator.device) for t in vae_scale]
 
-    with torch.no_grad(), accelerator.autocast():
-        for prompt_dict in prompts:
-            _sample_image_inference(
-                accelerator, args, dit, text_encoder, vae, vae_scale_gpu,
-                tokenize_strategy, text_encoding_strategy,
-                save_dir, prompt_dict, epoch, steps,
-                sample_prompts_te_outputs, prompt_replacement,
-            )
+        with torch.no_grad(), accelerator.autocast():
+            for prompt_dict in my_prompts:
+                _sample_image_inference(
+                    accelerator, args, dit, text_encoder, vae, vae_scale_gpu,
+                    tokenize_strategy, text_encoding_strategy,
+                    save_dir, prompt_dict, epoch, steps,
+                    sample_prompts_te_outputs, prompt_replacement,
+                    dit_secondary=dit_secondary,
+                )
 
-    # Move VAE back and clean up
-    vae.to(org_vae_device)
-    clean_memory_on_device(accelerator.device)
+        # Move VAE back and clean up
+        vae.to(org_vae_device)
+        clean_memory_on_device(accelerator.device)
+
+    # Synchronize all processes before resuming training
+    accelerator.wait_for_everyone()
 
 
 def _sample_image_inference(
@@ -537,6 +645,7 @@ def _sample_image_inference(
     tokenize_strategy, text_encoding_strategy,
     save_dir, prompt_dict, epoch, steps,
     sample_prompts_te_outputs, prompt_replacement,
+    dit_secondary=None,
 ):
     """Generate a single sample image."""
     prompt = prompt_dict.get("prompt", "")
@@ -638,8 +747,14 @@ def _sample_image_inference(
             from library.custom_offloading_utils import weighs_to_device
             for block in dit.blocks:
                 weighs_to_device(block, accelerator.device)
+            if dit_secondary is not None:
+                sec_device = next(dit_secondary.parameters()).device
+                for block in dit_secondary.blocks:
+                    weighs_to_device(block, sec_device)
             torch.cuda.synchronize()
             dit.blocks_to_swap = 0
+            if dit_secondary is not None:
+                dit_secondary.blocks_to_swap = 0
 
         # Generate sample
         clean_memory_on_device(accelerator.device)
@@ -647,6 +762,7 @@ def _sample_image_inference(
             height, width, seed, dit, crossattn_emb,
             sample_steps, dit.t_embedding_norm.weight.dtype,
             accelerator.device, scale, neg_crossattn_emb,
+            dit_secondary=dit_secondary,
         )
 
     except torch.cuda.OutOfMemoryError as e:
@@ -657,6 +773,11 @@ def _sample_image_inference(
             # Restore block swap early
             dit.blocks_to_swap = original_blocks_to_swap
             dit.prepare_block_swap_before_forward()  # Move blocks back to CPU
+            
+            if dit_secondary is not None:
+                dit_secondary.blocks_to_swap = original_blocks_to_swap
+                dit_secondary.prepare_block_swap_before_forward()
+
             clean_memory_on_device(accelerator.device)
             
             # Retry sample generation
@@ -664,15 +785,20 @@ def _sample_image_inference(
                 height, width, seed, dit, crossattn_emb,
                 sample_steps, dit.t_embedding_norm.weight.dtype,
                 accelerator.device, scale, neg_crossattn_emb,
+                dit_secondary=dit_secondary,
             )
         else:
             raise e
 
     finally:
-        if original_blocks_to_swap and original_blocks_to_swap > 0 and getattr(dit, "blocks_to_swap", 0) == 0:
-            logger.info("Restoring block swap after sampling")
-            dit.blocks_to_swap = original_blocks_to_swap
-            dit.prepare_block_swap_before_forward()  # Move blocks back to CPU as needed
+        if original_blocks_to_swap and original_blocks_to_swap > 0:
+            if getattr(dit, "blocks_to_swap", 0) == 0:
+                logger.info("Restoring block swap after sampling")
+                dit.blocks_to_swap = original_blocks_to_swap
+                dit.prepare_block_swap_before_forward()
+            if dit_secondary is not None and getattr(dit_secondary, "blocks_to_swap", 0) == 0:
+                dit_secondary.blocks_to_swap = original_blocks_to_swap
+                dit_secondary.prepare_block_swap_before_forward()
             clean_memory_on_device(accelerator.device)
 
     # Decode latents
@@ -703,12 +829,14 @@ def _sample_image_inference(
     ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
     num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
     seed_suffix = "" if seed is None else f"_{seed}"
+    rank = accelerator.process_index
+    rank_suffix = f"_gpu{rank}" if accelerator.num_processes > 1 else ""
     i = prompt_dict.get("enum", 0)
-    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
+    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}{rank_suffix}.png"
     image.save(os.path.join(save_dir, img_filename), pnginfo=png_info)
 
-    # Log to wandb if enabled
-    if "wandb" in [tracker.name for tracker in accelerator.trackers]:
+    # Log to wandb if enabled (main process only to avoid duplicate logging)
+    if accelerator.is_main_process and "wandb" in [tracker.name for tracker in accelerator.trackers]:
         wandb_tracker = accelerator.get_tracker("wandb")
         import wandb
         wandb_tracker.log({f"sample_{i}": wandb.Image(image, caption=prompt)}, commit=False)

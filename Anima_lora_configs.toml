@@ -1,24 +1,24 @@
 # Anima LoRA Training Configuration
 
 [model_arguments]
-dit_path = "C:\\Anima\\split_files\\diffusion_models\\anima-preview.safetensors"
-qwen3_path = "C:\\Anima\\split_files\\text_encoders\\qwen_3_06b_base.safetensors"
-vae_path = "C:\\Anima\\split_files\\vae\\qwen_image_vae.safetensors"
+dit_path = "/path/to/anima-preview.safetensors"
+qwen3_path = "/path/to/qwen_3_06b_base.safetensors"
+vae_path = "/path/to/qwen_image_vae.safetensors"
 
 [dataset_arguments]
-dataset_config = "c:\\sd-scripts\\dataset.toml"
+dataset_config = "/path/to/dataset.toml"
 cache_latents_to_disk = true
 cache_text_encoder_outputs = true
 # train_data_dir is not needed when using dataset_config
 
 
 [training_arguments]
-output_dir = "C:\\output\\lora_testing_aemeath"
+output_dir = "./output/my_anima_lora"
 output_name = "my_anima_lora"
 save_model_as = "safetensors"
 max_train_epochs = 20
 save_every_n_epochs = 1
-logging_dir = "C:\\output\\lora_testing_aemeath\\logs"
+logging_dir = "./output/my_anima_lora/logs"
 log_with = "tensorboard"
 learning_rate = 5e-5
 text_encoder_lr = 5e-5
@@ -37,7 +37,7 @@ timestep_sample_method = "logit_normal"
 discrete_flow_shift = 3.0
 
 [sample_arguments]
-sample_prompts = "c:\\sd-scripts\\sample_prompts.txt"
+sample_prompts = "./sample_prompts.txt"
 sample_every_n_epochs = 1
 
 [network_arguments]
