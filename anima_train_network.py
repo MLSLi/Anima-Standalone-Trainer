@@ -471,7 +471,14 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
 
         if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+            # WanVAE produces 5D latents [B,C,T,H,W] even for images (T=1).
+            # Squeeze temporal dim so apply_masked_loss sees 4D [B,C,H,W].
+            squeezed = loss.dim() == 5 and loss.shape[2] == 1
+            if squeezed:
+                loss = loss.squeeze(2)
             loss = apply_masked_loss(loss, batch)
+            if squeezed:
+                loss = loss.unsqueeze(2)
 
         # Reduce all non-batch dims: (B, C, T, H, W) -> (B,) for 5D, (B, C, H, W) -> (B,) for 4D
         reduce_dims = list(range(1, loss.ndim))
