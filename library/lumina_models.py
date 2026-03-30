@@ -46,10 +46,6 @@ except:
 try:
     from apex.normalization import FusedRMSNorm as RMSNorm
 except:
-    import warnings
-
-    warnings.warn("Cannot import apex RMSNorm, switch to vanilla implementation")
-
     #############################################################################
     #                                 RMSNorm                                   #
     #############################################################################
