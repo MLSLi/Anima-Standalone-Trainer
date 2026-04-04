@@ -1272,6 +1272,12 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         const trainCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${accelerateFlags} "${targetScript}" --config_file="${mergedConfigPath}"`;
         const trainScript = buildShellScript(venv.activate, trainEnvVars, trainCmd);
 
+        const scriptPath = path.join(jobPath, isWindows ? 'launch_command.ps1' : 'launch_command.sh');
+        fs.writeFileSync(scriptPath, trainScript, 'utf8');
+        console.log(`\n--- Training Launch Command for ${jobName} ---`);
+        console.log(trainScript);
+        console.log("----------------------------------------------\n");
+
         const proc = spawnShell(trainScript, ROOT_DIR);
 
         const logBuffer = [];
