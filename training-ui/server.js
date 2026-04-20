@@ -1404,7 +1404,7 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
                 pid: oneShotProc.pid,
                 startTime: Date.now(),
                 type: 'generation',
-                gpuIds: currentGpuIds
+                gpuIds: currentGpuIdsRaw
             });
 
             broadcastStatus(jobName, 'generating');
