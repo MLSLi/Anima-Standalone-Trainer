@@ -206,6 +206,13 @@ class CudaIpcMemHandle(ctypes.Structure):
 _cudart.cudaIpcGetMemHandle.argtypes = [ctypes.POINTER(CudaIpcMemHandle), ctypes.c_void_p]
 _cudart.cudaIpcGetMemHandle.restype = ctypes.c_int
 
+# cudaGetLastError clears the per-thread CUDA error state and returns it.
+# Call this after any failed CUDA API to prevent the stale error from being
+# picked up later by PyTorch's StorageImpl destructor (which calls a CUDA sync
+# check on tensor free), causing a deferred SIGABRT through c10_cuda_check.
+_cudart.cudaGetLastError.argtypes = []
+_cudart.cudaGetLastError.restype = ctypes.c_int
+
 _cudart.cudaIpcOpenMemHandle.argtypes = [ctypes.POINTER(ctypes.c_void_p), CudaIpcMemHandle, ctypes.c_uint]
 _cudart.cudaIpcOpenMemHandle.restype = ctypes.c_int
 
@@ -235,12 +242,22 @@ cudaHostRegisterPortable = 0x01   # mapping visible to all CUDA contexts (cross-
 cudaHostRegisterMapped   = 0x02   # map host address into device address space
 
 
-# IPC handle cache: data_ptr -> (handle_bytes, numel, device_index)
-# FSDP/DDP typically reuse the same tensor buffers across training steps,
-# so the same data_ptr maps to the same IPC handle. This avoids repeated
-# cudaIpcGetMemHandle driver calls (~0.004ms each, but adds up with
-# hundreds of layers per step).
-_ipc_handle_cache: dict[int, bytes] = {}
+# IPC handle cache: data_ptr -> (handle_bytes, ipc_offset_bytes)
+#
+# IMPORTANT: cudaIpcGetMemHandle requires the **base pointer** of a cudaMalloc
+# allocation.  PyTorch's caching allocator sub-allocates from large cudaMalloc
+# blocks, so a tensor's data_ptr() is almost never the block's base address.
+# Passing a sub-allocation pointer to cudaIpcGetMemHandle returns
+# cudaErrorInvalidValue.
+#
+# We therefore use storage._share_cuda_() (the same mechanism PyTorch's
+# multiprocessing uses) which returns the IPC handle for the underlying
+# cudaMalloc block *plus* the byte offset from that block to the tensor's data.
+# The receiver opens the handle (gets the base pointer) then adds the offset.
+#
+# FSDP/DDP typically reuse the same tensor buffers across steps, so caching
+# avoids repeated _share_cuda_() calls (~0.01 ms each).
+_ipc_handle_cache: dict[int, tuple[bytes, int]] = {}
 _ipc_cache_hits: int = 0
 _ipc_cache_misses: int = 0
 
@@ -259,36 +276,64 @@ def invalidate_ipc_handle_cache() -> None:
     _ipc_cache_misses = 0
 
 
-def get_ipc_handle(tensor: torch.Tensor) -> bytes:
+def get_ipc_handle_and_offset(tensor: torch.Tensor) -> tuple[bytes, int]:
+    """Return (ipc_handle_bytes, byte_offset) for a CUDA tensor.
+
+    Uses storage._share_cuda_() so that sub-allocations from PyTorch's caching
+    allocator work correctly.  The returned handle is for the underlying
+    cudaMalloc block; byte_offset is how far into that block the tensor's data
+    starts.  The receiver must open the handle and add byte_offset before any
+    DMA operation.
+
+    Results are cached by data_ptr() so repeated calls within one collective
+    are free.
+    """
     global _ipc_cache_hits, _ipc_cache_misses
     if not tensor.is_cuda:
         raise ValueError(
-            f"cuda_direct_backend: get_ipc_handle requires a CUDA tensor, "
+            f"cuda_direct_backend: get_ipc_handle_and_offset requires a CUDA tensor, "
             f"got device='{tensor.device}'"
         )
     ptr = tensor.data_ptr()
 
-    # Cache lookup
     cached = _ipc_handle_cache.get(ptr)
     if cached is not None:
         _ipc_cache_hits += 1
         return cached
 
-    # Cache miss — call the driver
     _ipc_cache_misses += 1
-    handle = CudaIpcMemHandle()
-    c_ptr = ctypes.c_void_p(ptr)
-    res = _cudart.cudaIpcGetMemHandle(ctypes.byref(handle), c_ptr)
-    check_cuda_error(res, "cudaIpcGetMemHandle",
-                     ptr=hex(ptr),
-                     device=tensor.device,
-                     numel=tensor.numel(),
-                     dtype=tensor.dtype)
-    handle_bytes = bytes(handle.internal)
-    _ipc_handle_cache[ptr] = handle_bytes
-    logger.debug("cudaIpcGetMemHandle OK  ptr=%s  numel=%d  dtype=%s  (cached)",
-                 hex(ptr), tensor.numel(), tensor.dtype)
-    return handle_bytes
+    try:
+        storage = tensor.untyped_storage()
+        # _share_cuda_() -> (device, handle_bytes, storage_size, storage_offset_bytes,
+        #                     ref_counter_handle, ref_counter_offset,
+        #                     event_handle, event_sync_required)
+        _, handle_bytes, _, storage_offset_bytes, *_ = storage._share_cuda_()
+    except Exception as exc:
+        raise RuntimeError(
+            f"cuda_direct_backend: storage._share_cuda_() failed for tensor "
+            f"ptr={hex(ptr)} device={tensor.device} numel={tensor.numel()} "
+            f"dtype={tensor.dtype}: {exc}"
+        ) from exc
+
+    # Tensor may be a storage slice (e.g. a parameter view).
+    tensor_byte_offset = tensor.storage_offset() * tensor.element_size()
+    total_offset = storage_offset_bytes + tensor_byte_offset
+
+    result = (handle_bytes, total_offset)
+    _ipc_handle_cache[ptr] = result
+    logger.debug(
+        "get_ipc_handle_and_offset OK  ptr=%s  storage_offset=%d  tensor_offset=%d  "
+        "total_offset=%d  numel=%d  dtype=%s",
+        hex(ptr), storage_offset_bytes, tensor_byte_offset, total_offset,
+        tensor.numel(), tensor.dtype,
+    )
+    return result
+
+
+def get_ipc_handle(tensor: torch.Tensor) -> bytes:
+    """Compatibility wrapper"""
+    handle, _offset = get_ipc_handle_and_offset(tensor)
+    return handle
 
 
 def open_ipc_handle(handle_bytes: bytes, device_index: int) -> int:

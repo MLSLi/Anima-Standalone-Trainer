@@ -267,7 +267,7 @@ class ShmTransport:
         # If the version changed (peer grew its SHM), invalidate cached handle
         # and re-open the new versioned region.
         try:
-            _numel, _dc, _dev, ipc_bytes = sync.read_tensor_meta(peer_rank)
+            _numel, _dc, _dev, ipc_bytes, _ipc_off = sync.read_tensor_meta(peer_rank)
             peer_version = struct.unpack_from('<Q', ipc_bytes)[0]
         except Exception:
             peer_version = self._peer_shm_version.get(peer_rank, 0)

@@ -132,17 +132,18 @@ class CudaPeerTransport:
         pass
 
     def publish_tensor(self, tensor: "torch.Tensor", sync) -> None:
-        """Write this rank's IPC handle to sync so peers can fetch_chunk from this tensor."""
-        handle = cuda_ipc.get_ipc_handle(tensor)
-        sync.write_tensor_meta(tensor.numel(), 0, tensor.device.index, handle)
+        """Write this rank's IPC handle + sub-allocation offset to sync."""
+        handle, offset = cuda_ipc.get_ipc_handle_and_offset(tensor)
+        sync.write_tensor_meta(tensor.numel(), 0, tensor.device.index, handle,
+                               ipc_offset=offset)
 
     def fetch_chunk(self, peer_rank: int, dst_tensor: "torch.Tensor",
                     src_offset_bytes: int, size_bytes: int, sync) -> None:
-        """Open peer's IPC handle (cached) and DMA size_bytes at src_offset into dst_tensor."""
-        _, _, dev_idx, handle = sync.read_tensor_meta(peer_rank)
-        peer_ptr = self.get_or_open_ipc_handle(peer_rank, handle, dev_idx)
+        """Open peer's IPC handle (cached), apply sub-allocation offset, then DMA."""
+        _, _, dev_idx, handle, ipc_offset = sync.read_tensor_meta(peer_rank)
+        peer_base = self.get_or_open_ipc_handle(peer_rank, handle, dev_idx)
         self.copy_tensor(size_bytes, dst_tensor.data_ptr(),
-                         peer_ptr + src_offset_bytes, peer_rank)
+                         peer_base + ipc_offset + src_offset_bytes, peer_rank)
 
     def wait_for_peer(self, peer_rank: int) -> None:
         """Make the current CUDA stream wait for the last DMA from peer to finish."""

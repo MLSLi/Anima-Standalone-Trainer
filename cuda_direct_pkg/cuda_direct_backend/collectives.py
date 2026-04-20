@@ -72,9 +72,10 @@ class CollectivesImpl:
         return buf
 
     def _exchange_handles(self, tensor: torch.Tensor):
-        """Write IPC handle for tensor to sync (P2P direct algorithms only)."""
-        handle = cuda_ipc.get_ipc_handle(tensor)
-        self.sync.write_tensor_meta(tensor.numel(), 0, tensor.device.index, handle)
+        """Write IPC handle + offset for tensor to sync (P2P direct algorithms only)."""
+        handle, offset = cuda_ipc.get_ipc_handle_and_offset(tensor)
+        self.sync.write_tensor_meta(tensor.numel(), 0, tensor.device.index, handle,
+                                    ipc_offset=offset)
 
     # ---------------------------------------------------------------
     #  ReduceOp helpers
@@ -229,13 +230,13 @@ class CollectivesImpl:
         peer_ptrs = []
         for p in range(self.world_size):
             if p != self.rank:
-                numel, _, dev_idx, handle = self.sync.read_tensor_meta(p)
+                numel, _, dev_idx, handle, ipc_off = self.sync.read_tensor_meta(p)
                 if numel != tensor.numel():
                     raise RuntimeError(
                         f"cuda_direct allreduce size mismatch: "
                         f"rank={self.rank} numel={tensor.numel()}, peer={p} numel={numel}"
                     )
-                ptr = self.transport.get_or_open_ipc_handle(p, handle, dev_idx)
+                ptr = self.transport.get_or_open_ipc_handle(p, handle, dev_idx) + ipc_off
                 peer_ptrs.append((p, ptr))
 
         size_bytes = tensor.numel() * tensor.element_size()
@@ -446,8 +447,9 @@ class CollectivesImpl:
 
     def _direct_allgather_base(self, output_tensor, input_tensor):
         """All-to-all allgather for 2 GPUs (P2P only)."""
-        handle = cuda_ipc.get_ipc_handle(output_tensor)
-        self.sync.write_tensor_meta(output_tensor.numel(), 0, output_tensor.device.index, handle)
+        handle, ipc_off = cuda_ipc.get_ipc_handle_and_offset(output_tensor)
+        self.sync.write_tensor_meta(output_tensor.numel(), 0, output_tensor.device.index,
+                                    handle, ipc_offset=ipc_off)
 
         input_numel = input_tensor.numel()
         start_idx = self.rank * input_numel
@@ -467,8 +469,8 @@ class CollectivesImpl:
         peer_ptrs = []
         for p in range(self.world_size):
             if p != self.rank:
-                numel, _, dev_idx, peer_handle = self.sync.read_tensor_meta(p)
-                ptr = self.transport.get_or_open_ipc_handle(p, peer_handle, dev_idx)
+                numel, _, dev_idx, peer_handle, peer_ipc_off = self.sync.read_tensor_meta(p)
+                ptr = self.transport.get_or_open_ipc_handle(p, peer_handle, dev_idx) + peer_ipc_off
                 peer_ptrs.append((p, ptr))
 
         src_base = input_tensor.data_ptr()
@@ -625,8 +627,9 @@ class CollectivesImpl:
 
     def _direct_reduce_scatter_base(self, output_tensor, input_tensor, op):
         """All-to-all reduce-scatter for 2 GPUs (P2P only)."""
-        handle = cuda_ipc.get_ipc_handle(input_tensor)
-        self.sync.write_tensor_meta(input_tensor.numel(), 0, input_tensor.device.index, handle)
+        handle, ipc_off = cuda_ipc.get_ipc_handle_and_offset(input_tensor)
+        self.sync.write_tensor_meta(input_tensor.numel(), 0, input_tensor.device.index,
+                                    handle, ipc_offset=ipc_off)
         self.sync.barrier()
 
         output_numel = output_tensor.numel()
@@ -635,13 +638,13 @@ class CollectivesImpl:
         peer_ptrs = []
         for p in range(self.world_size):
             if p != self.rank:
-                numel, _, dev_idx, peer_handle = self.sync.read_tensor_meta(p)
+                numel, _, dev_idx, peer_handle, peer_ipc_off = self.sync.read_tensor_meta(p)
                 if numel != input_tensor.numel():
                     raise RuntimeError(
                         f"cuda_direct reduce_scatter size mismatch: "
                         f"rank={self.rank} numel={input_tensor.numel()}, peer={p} numel={numel}"
                     )
-                ptr = self.transport.get_or_open_ipc_handle(p, peer_handle, dev_idx)
+                ptr = self.transport.get_or_open_ipc_handle(p, peer_handle, dev_idx) + peer_ipc_off
                 peer_ptrs.append((p, ptr))
 
         bytes_per_elem = output_tensor.element_size()
@@ -753,12 +756,40 @@ class CollectivesImpl:
         # No extra barrier needed: process_group._reduce_scatter_base calls barrier() after
 
     # ---------------------------------------------------------------
+    #  AllToAll helpers
+    # ---------------------------------------------------------------
+
+    @staticmethod
+    def _prefix_sums(sizes: list) -> list:
+        """Return exclusive prefix sums: [0, sizes[0], sizes[0]+sizes[1], ...]"""
+        offsets = [0] * len(sizes)
+        for i in range(1, len(sizes)):
+            offsets[i] = offsets[i - 1] + sizes[i - 1]
+        return offsets
+
+    # ---------------------------------------------------------------
     #  AllToAll
     # ---------------------------------------------------------------
 
     def all_to_all_single(self, output_tensor, input_tensor,
                           output_split_sizes=None, input_split_sizes=None):
-        """All-to-all: rank r sends its p-th chunk to rank p, receives its r-th chunk from rank p."""
+        """All-to-all: rank r sends its p-th chunk to rank p, receives its r-th chunk from rank p.
+
+        Equal splits: output_split_sizes and input_split_sizes are both None (or omitted).
+            Each rank sends/receives exactly numel/world_size elements to/from every peer.
+
+        Unequal splits: one or both split-size lists are supplied.
+            input_split_sizes[p]  — number of elements this rank sends to rank p.
+            output_split_sizes[p] — number of elements this rank receives from rank p.
+            output_split_sizes[p] must equal rank p's input_split_sizes[self.rank].
+
+        Protocol (pull model, same as equal-split):
+          1. Each rank publishes its input tensor (IPC handle / SHM region) and its
+             input_split_sizes array into the shared metadata slot.
+          2. After a barrier, each rank reads every peer's split sizes, computes the
+             source byte offset as prefix_sum(peer_input_split_sizes[:self.rank]), and
+             issues a DMA copy of the correct slice into the local output buffer.
+        """
         self._validate_tensors([output_tensor, input_tensor], "all_to_all")
 
         N = self.world_size
@@ -769,14 +800,6 @@ class CollectivesImpl:
             algo = "ring"
         else:
             algo = "direct"
-        logger.debug("all_to_all_single  rank=%d  input_shape=%s  size=%.3fMB  algo=%s",
-                     self.rank, input_tensor.shape, size_mb, algo)
-
-        if output_split_sizes or input_split_sizes:
-            raise NotImplementedError(
-                f"cuda_direct all_to_all_single: unequal split sizes not yet supported "
-                f"(rank={self.rank})"
-            )
 
         if not output_tensor.is_contiguous():
             raise ValueError(
@@ -785,6 +808,68 @@ class CollectivesImpl:
             )
         if not input_tensor.is_contiguous():
             input_tensor = input_tensor.contiguous()
+
+        # ── Unequal-splits path ─────────────────────────────────────────────
+        if output_split_sizes is not None or input_split_sizes is not None:
+            total_in  = input_tensor.numel()
+            total_out = output_tensor.numel()
+
+            in_splits  = list(input_split_sizes)  if input_split_sizes  is not None \
+                         else [total_in  // N] * N
+            out_splits = list(output_split_sizes) if output_split_sizes is not None \
+                         else [total_out // N] * N
+
+            if len(in_splits) != N:
+                raise ValueError(
+                    f"cuda_direct all_to_all: input_split_sizes length {len(in_splits)} "
+                    f"!= world_size {N}  (rank={self.rank})"
+                )
+            if len(out_splits) != N:
+                raise ValueError(
+                    f"cuda_direct all_to_all: output_split_sizes length {len(out_splits)} "
+                    f"!= world_size {N}  (rank={self.rank})"
+                )
+            if any(s < 0 for s in in_splits):
+                raise ValueError(
+                    f"cuda_direct all_to_all: negative value in input_split_sizes "
+                    f"{in_splits}  (rank={self.rank})"
+                )
+            if any(s < 0 for s in out_splits):
+                raise ValueError(
+                    f"cuda_direct all_to_all: negative value in output_split_sizes "
+                    f"{out_splits}  (rank={self.rank})"
+                )
+            if sum(in_splits) != total_in:
+                raise ValueError(
+                    f"cuda_direct all_to_all: sum(input_split_sizes)={sum(in_splits)} "
+                    f"!= input numel {total_in}  (rank={self.rank})"
+                )
+            if sum(out_splits) != total_out:
+                raise ValueError(
+                    f"cuda_direct all_to_all: sum(output_split_sizes)={sum(out_splits)} "
+                    f"!= output numel {total_out}  (rank={self.rank})"
+                )
+
+            logger.debug(
+                "all_to_all_single  rank=%d  UNEQUAL  input_shape=%s  size=%.3fMB  "
+                "algo=%s  in_splits=%s  out_splits=%s",
+                self.rank, input_tensor.shape, size_mb, algo, in_splits, out_splits,
+            )
+
+            output_tensor = output_tensor.view(-1)
+            input_tensor  = input_tensor.view(-1)
+
+            if self._is_shm:
+                self._shm_alltoallv(output_tensor, input_tensor, out_splits, in_splits)
+            elif self._use_ring:
+                self._ring_alltoallv(output_tensor, input_tensor, out_splits, in_splits)
+            else:
+                self._direct_alltoallv(output_tensor, input_tensor, out_splits, in_splits)
+            return
+
+        # ── Equal-splits path ───────────────────────────────────────────────
+        logger.debug("all_to_all_single  rank=%d  EQUAL  input_shape=%s  size=%.3fMB  algo=%s",
+                     self.rank, input_tensor.shape, size_mb, algo)
 
         total = input_tensor.numel()
         if total != output_tensor.numel():
@@ -821,17 +906,18 @@ class CollectivesImpl:
             input_tensor[own : own + chunk_numel])
 
         # Exchange IPC handles
-        handle = cuda_ipc.get_ipc_handle(input_tensor)
+        handle, ipc_off = cuda_ipc.get_ipc_handle_and_offset(input_tensor)
         self.sync.write_tensor_meta(
-            input_tensor.numel(), 0, input_tensor.device.index, handle)
+            input_tensor.numel(), 0, input_tensor.device.index, handle,
+            ipc_offset=ipc_off)
         self.sync.barrier()
 
         # Read chunk[self.rank] from each peer → output[peer]
         for p in range(N):
             if p == self.rank:
                 continue
-            numel, _, dev_idx, peer_handle = self.sync.read_tensor_meta(p)
-            ptr = self.transport.get_or_open_ipc_handle(p, peer_handle, dev_idx)
+            numel, _, dev_idx, peer_handle, peer_ipc_off = self.sync.read_tensor_meta(p)
+            ptr = self.transport.get_or_open_ipc_handle(p, peer_handle, dev_idx) + peer_ipc_off
             src_offset = self.rank * chunk_bytes
             dst_view = output_tensor.narrow(0, p * chunk_numel, chunk_numel)
             self.transport.copy_tensor(
@@ -905,6 +991,175 @@ class CollectivesImpl:
             for k in range(N - 1):
                 peer_rank = self.ring_order[(pos - 1 - k) % N]
                 self.transport.wait_for_peer(peer_rank)
+
+        torch.cuda.current_stream().synchronize()
+        self.sync.barrier()
+
+    # ---------------------------------------------------------------
+    #  AllToAllV  (unequal splits)
+    # ---------------------------------------------------------------
+    #
+    # Protocol mirrors the equal-split variants with one addition: each rank
+    # also publishes its input_split_sizes array into the free tail of the
+    # metadata slot (bytes [88:]).  After the barrier every rank reads each
+    # peer's split sizes, computes the source byte offset as
+    #
+    #     src_offset = prefix_sum(peer_input_split_sizes[:self.rank]) * elem_bytes
+    #
+    # and issues a DMA copy of exactly output_split_sizes[peer] elements into
+    # the correct position of the local output buffer.
+    #
+    # write_split_sizes / read_split_sizes live alongside write_tensor_meta in
+    # the same 256-byte slot but occupy non-overlapping byte ranges, so the
+    # two writes can happen in any order and both are visible after the barrier.
+
+    def _direct_alltoallv(self, output_tensor, input_tensor,
+                          output_split_sizes, input_split_sizes):
+        """P2P all-to-all with unequal splits for 2 GPUs."""
+        N = self.world_size
+        elem_bytes = input_tensor.element_size()
+        send_offsets = self._prefix_sums(input_split_sizes)
+        recv_offsets = self._prefix_sums(output_split_sizes)
+
+        # Self-copy: rank → rank chunk requires no network
+        own_size = input_split_sizes[self.rank]
+        if own_size > 0:
+            output_tensor[recv_offsets[self.rank] : recv_offsets[self.rank] + own_size].copy_(
+                input_tensor[send_offsets[self.rank] : send_offsets[self.rank] + own_size])
+
+        # Publish IPC handle for own input tensor + split sizes.
+        # write_split_sizes writes bytes [88:]; write_tensor_meta writes bytes [0:88].
+        # The two byte ranges do not overlap, so order is irrelevant, but writing
+        # splits first keeps split data stable before the IPC handle is visible.
+        handle, ipc_off = cuda_ipc.get_ipc_handle_and_offset(input_tensor)
+        self.sync.write_split_sizes(input_split_sizes)
+        self.sync.write_tensor_meta(input_tensor.numel(), 0,
+                                    input_tensor.device.index, handle,
+                                    ipc_offset=ipc_off)
+        self.sync.barrier()
+
+        current_stream = torch.cuda.current_stream()
+        for p in range(N):
+            if p == self.rank:
+                continue
+            recv_size = output_split_sizes[p]
+            if recv_size == 0:
+                continue
+
+            _numel, _, dev_idx, peer_handle, peer_ipc_off = self.sync.read_tensor_meta(p)
+            peer_splits       = self.sync.read_split_sizes(p, N)
+            peer_send_offsets = self._prefix_sums(peer_splits)
+
+            # Byte offset into peer's input where our data starts
+            src_offset_bytes = peer_send_offsets[self.rank] * elem_bytes
+            copy_bytes       = recv_size * elem_bytes
+            dst_ptr          = output_tensor.data_ptr() + recv_offsets[p] * elem_bytes
+
+            ptr = self.transport.get_or_open_ipc_handle(p, peer_handle, dev_idx) + peer_ipc_off
+            self.transport.copy_tensor(copy_bytes, dst_ptr, ptr + src_offset_bytes, p)
+
+        for p in range(N):
+            if p != self.rank and output_split_sizes[p] > 0:
+                current_stream.wait_stream(self.transport.streams[p])
+
+        current_stream.synchronize()
+        self.sync.barrier()
+
+    def _ring_alltoallv(self, output_tensor, input_tensor,
+                        output_split_sizes, input_split_sizes):
+        """P2P all-to-all with unequal splits for 3+ GPUs. Parallel fetch from all peers."""
+        N = self.world_size
+        elem_bytes = input_tensor.element_size()
+        send_offsets = self._prefix_sums(input_split_sizes)
+        recv_offsets = self._prefix_sums(output_split_sizes)
+        pos = self._ring_pos
+
+        # Self-copy
+        own_size = input_split_sizes[self.rank]
+        if own_size > 0:
+            output_tensor[recv_offsets[self.rank] : recv_offsets[self.rank] + own_size].copy_(
+                input_tensor[send_offsets[self.rank] : send_offsets[self.rank] + own_size])
+
+        # Publish split sizes then IPC handle (via publish_tensor).
+        # publish_tensor writes bytes [0:88]; write_split_sizes writes bytes [88:].
+        self.sync.write_split_sizes(input_split_sizes)
+        self.transport.publish_tensor(input_tensor, self.sync)
+        # Ensure own data is committed to device memory before barrier so peers'
+        # DMA reads see the correct contents.
+        torch.cuda.current_stream().synchronize()
+        self.sync.barrier()
+
+        # Issue all peer fetches in parallel — each uses its own DMA stream
+        for k in range(N - 1):
+            peer_rank = self.ring_order[(pos - 1 - k) % N]
+            recv_size = output_split_sizes[peer_rank]
+            if recv_size == 0:
+                continue
+
+            peer_splits       = self.sync.read_split_sizes(peer_rank, N)
+            peer_send_offsets = self._prefix_sums(peer_splits)
+            src_offset_bytes  = peer_send_offsets[self.rank] * elem_bytes
+            copy_bytes        = recv_size * elem_bytes
+            dst_view          = output_tensor.narrow(0, recv_offsets[peer_rank], recv_size)
+
+            self.transport.fetch_chunk(peer_rank, dst_view,
+                                       src_offset_bytes, copy_bytes, self.sync)
+
+        for k in range(N - 1):
+            peer_rank = self.ring_order[(pos - 1 - k) % N]
+            if output_split_sizes[peer_rank] > 0:
+                self.transport.wait_for_peer(peer_rank)
+
+        torch.cuda.current_stream().synchronize()
+        self.sync.barrier()
+
+    def _shm_alltoallv(self, output_tensor, input_tensor,
+                       output_split_sizes, input_split_sizes):
+        """SHM all-to-all with unequal splits."""
+        N = self.world_size
+        elem_bytes = input_tensor.element_size()
+        send_offsets = self._prefix_sums(input_split_sizes)
+        recv_offsets = self._prefix_sums(output_split_sizes)
+        pos = self._ring_pos
+
+        # Self-copy
+        own_size = input_split_sizes[self.rank]
+        if own_size > 0:
+            output_tensor[recv_offsets[self.rank] : recv_offsets[self.rank] + own_size].copy_(
+                input_tensor[send_offsets[self.rank] : send_offsets[self.rank] + own_size])
+
+        # Pre-publish barrier: prevents SHM regrowth race (see _shm_allreduce comment).
+        self.sync.barrier()
+
+        # Write split sizes (bytes [88:]) before publish_tensor (bytes [0:88]).
+        # Both are visible to peers after the barrier below.
+        self.sync.write_split_sizes(input_split_sizes)
+        self.transport.publish_tensor(input_tensor, self.sync)
+        self.sync.barrier()  # all ranks have published input data and split sizes
+
+        # Issue all peer fetches in parallel (per-peer H2D streams, no contention)
+        for k in range(N - 1):
+            peer_rank = self.ring_order[(pos - 1 - k) % N]
+            recv_size = output_split_sizes[peer_rank]
+            if recv_size == 0:
+                continue
+
+            peer_splits       = self.sync.read_split_sizes(peer_rank, N)
+            peer_send_offsets = self._prefix_sums(peer_splits)
+            src_offset_bytes  = peer_send_offsets[self.rank] * elem_bytes
+            copy_bytes        = recv_size * elem_bytes
+            dst_view          = output_tensor.narrow(0, recv_offsets[peer_rank], recv_size)
+
+            self.transport.fetch_chunk(peer_rank, dst_view,
+                                       src_offset_bytes, copy_bytes, self.sync)
+
+        if hasattr(self.transport, 'wait_all_peers'):
+            self.transport.wait_all_peers()
+        else:
+            for k in range(N - 1):
+                peer_rank = self.ring_order[(pos - 1 - k) % N]
+                if output_split_sizes[peer_rank] > 0:
+                    self.transport.wait_for_peer(peer_rank)
 
         torch.cuda.current_stream().synchronize()
         self.sync.barrier()

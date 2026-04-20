@@ -21,6 +21,20 @@ _BARRIER_COUNTER_SIZE = 4   # int32 per rank arrival flag
 _BARRIER_PHASE_SIZE = 4     # int32 global phase
 _IPC_HANDLE_SIZE = 64       # cudaIpcMemHandle_t size
 
+# Byte layout within each metadata slot:
+#   [0:8]   numel (int64)
+#   [8:12]  dtype_code (int32)
+#   [12:16] device_index (int32)
+#   [16:80] ipc_handle (64 bytes)
+#   [80:88] ipc_offset (int64) — byte offset from the IPC base ptr to the tensor data
+#           Required because PyTorch's caching allocator sub-allocates from large
+#           cudaMalloc blocks; cudaIpcGetMemHandle gives the block's handle, not the
+#           tensor's handle.  The receiver adds this offset after opening the handle.
+#   [88:]   split sizes (int32 each) — used by variable all_to_all
+_TENSOR_META_SIZE = 88      # bytes consumed by write_tensor_meta (was 80)
+_SPLIT_SIZES_OFFSET = _TENSOR_META_SIZE
+_SPLIT_SIZES_MAX = (_SLOT_SIZE - _TENSOR_META_SIZE) // 4  # max world_size supported (42)
+
 # How long to spin before emitting a slow-barrier warning (seconds)
 _BARRIER_WARN_AFTER = 5.0
 # Interval between slow-barrier log lines so they don't flood the log
@@ -320,7 +334,7 @@ class SharedMemorySync:
         return self.read_slot(rank, _IPC_HANDLE_SIZE)
 
     def write_tensor_meta(self, numel: int, dtype_code: int, device_index: int,
-                          ipc_handle: bytes = b''):
+                          ipc_handle: bytes = b'', ipc_offset: int = 0):
         """Write tensor metadata + optional IPC handle to this rank's slot.
 
         Layout:
@@ -328,25 +342,30 @@ class SharedMemorySync:
           [8:12]  dtype_code (int32)
           [12:16] device_index (int32)
           [16:80] ipc_handle (64 bytes, optional)
+          [80:88] ipc_offset (int64) — byte offset from IPC base to tensor data
         """
         meta = struct.pack('<qii', numel, dtype_code, device_index)
         if ipc_handle:
             meta += ipc_handle
+        else:
+            meta += b'\x00' * _IPC_HANDLE_SIZE
+        meta += struct.pack('<q', ipc_offset)
         self.write_slot(meta)
-        logger.debug("write_tensor_meta  rank=%d  numel=%d  device=%d",
-                     self._rank, numel, device_index)
+        logger.debug("write_tensor_meta  rank=%d  numel=%d  device=%d  ipc_offset=%d",
+                     self._rank, numel, device_index, ipc_offset)
 
     def read_tensor_meta(self, rank: int):
         """Read tensor metadata from a rank's slot.
 
-        Returns: (numel, dtype_code, device_index, ipc_handle_bytes)
+        Returns: (numel, dtype_code, device_index, ipc_handle_bytes, ipc_offset)
         """
-        data = self.read_slot(rank, 16 + _IPC_HANDLE_SIZE)
+        data = self.read_slot(rank, _TENSOR_META_SIZE)
         numel, dtype_code, device_index = struct.unpack_from('<qii', data, 0)
         ipc_handle = data[16:16 + _IPC_HANDLE_SIZE]
-        logger.debug("read_tensor_meta  from_rank=%d  numel=%d  device=%d",
-                     rank, numel, device_index)
-        return numel, dtype_code, device_index, ipc_handle
+        ipc_offset, = struct.unpack_from('<q', data, 16 + _IPC_HANDLE_SIZE)
+        logger.debug("read_tensor_meta  from_rank=%d  numel=%d  device=%d  ipc_offset=%d",
+                     rank, numel, device_index, ipc_offset)
+        return numel, dtype_code, device_index, ipc_handle, ipc_offset
 
     def next_seq(self) -> int:
         self._seq_num += 1
@@ -382,3 +401,31 @@ class SharedMemorySync:
     def read_status(self, src_rank: int) -> int:
         offset = self._ctrl_offset(src_rank, self._rank)
         return struct.unpack_from('<I', self._ctrl_shm.buf, offset + 16)[0]
+
+    def write_split_sizes(self, split_sizes: list) -> None:
+        """Write per-peer split size array to bytes [80:] of this rank's metadata slot.
+        Maximum supported world_size is _SPLIT_SIZES_MAX (44 for the default
+        _SLOT_SIZE of 256).
+        """
+        n = len(split_sizes)
+        if n > _SPLIT_SIZES_MAX:
+            raise ValueError(
+                f"cuda_direct_backend: world_size={n} exceeds the maximum number of "
+                f"split sizes that fit in the metadata slot ({_SPLIT_SIZES_MAX}). "
+                f"Increase _SLOT_SIZE from {_SLOT_SIZE} to at least "
+                f"{_TENSOR_META_SIZE + n * 4} bytes to support this world size."
+            )
+        data = struct.pack(f'<{n}I', *split_sizes)
+        offset = self._slot_offset(self._rank) + _SPLIT_SIZES_OFFSET
+        self._meta_shm.buf[offset:offset + len(data)] = data
+
+    def read_split_sizes(self, rank: int, n: int) -> list:
+        """Read n split sizes (int32) from bytes [80:] of a rank's metadata slot."""
+        if n > _SPLIT_SIZES_MAX:
+            raise ValueError(
+                f"cuda_direct_backend: cannot read {n} split sizes from slot "
+                f"(max {_SPLIT_SIZES_MAX} for _SLOT_SIZE={_SLOT_SIZE})."
+            )
+        offset = self._slot_offset(rank) + _SPLIT_SIZES_OFFSET
+        data = bytes(self._meta_shm.buf[offset:offset + n * 4])
+        return list(struct.unpack_from(f'<{n}I', data))

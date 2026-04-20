@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import torch
@@ -22,6 +23,13 @@ from .collectives import CollectivesImpl
 from .comm_timer import CommTimer, dtype_str
 
 logger = logging.getLogger("cuda_direct.pg")
+
+
+def _normalize_global_ranks(rank: int, world_size: int, global_ranks_in_group) -> list[int]:
+    if global_ranks_in_group:
+        return [int(r) for r in global_ranks_in_group]
+    return list(range(world_size))
+
 
 def ret_work(ret):
     """Return a completed Work object (synchronous path)."""
@@ -150,7 +158,17 @@ def _drain_pools(*pools: ThreadPoolExecutor) -> None:
 
 
 class ProcessGroupCudaDirect(dist.ProcessGroup):
-    def __init__(self, store, rank, world_size, timeout):
+    def __init__(
+        self,
+        store,
+        rank,
+        world_size,
+        timeout,
+        *,
+        group_id: str | None = None,
+        global_ranks_in_group=None,
+        group_desc: str | None = None,
+    ):
         import os
         if os.name != "nt":
             raise RuntimeError(
@@ -158,10 +176,15 @@ class ProcessGroupCudaDirect(dist.ProcessGroup):
                 "On Linux, use NCCL: dist.init_process_group(backend='nccl'). "
                 "Do not call register_backend() or activate() on Linux."
             )
+
         super().__init__(rank, world_size)
         self.store = store
         self._rank = rank
         self._world_size = world_size
+        self._group_name: str | None = None
+        self._group_desc = group_desc or "undefined"
+        self._group_id = group_id or "default"
+        self._global_ranks_in_group = _normalize_global_ranks(rank, world_size, global_ranks_in_group)
 
         logger.info("ProcessGroupCudaDirect init  rank=%d  world_size=%d  device=%d",
                     rank, world_size, torch.cuda.current_device())
@@ -263,6 +286,22 @@ class ProcessGroupCudaDirect(dist.ProcessGroup):
 
     def getBackendName(self):
         return "cuda_direct"
+
+    # ------------------------------------------------------------------
+    # group_name support (required by DeviceMesh in torch ≥ 2.10)
+    # PyTorch's _new_process_group_helper calls pg._set_group_name(name)
+    # after the backend creator returns; DeviceMesh then reads pg.group_name.
+    # ------------------------------------------------------------------
+
+    @property
+    def group_name(self) -> str | None:
+        return self._group_name
+
+    def _set_group_name(self, group_name: str) -> None:
+        self._group_name = group_name
+
+    def _set_group_desc(self, group_desc: str) -> None:
+        self._group_desc = group_desc
 
     def _algo(self) -> str:
         """Return the active transport algorithm name for event recording."""
@@ -503,6 +542,24 @@ class ProcessGroupCudaDirect(dist.ProcessGroup):
 def _create_cuda_direct_pg(prefix_store, rank, world_size, timeout):
     return ProcessGroupCudaDirect(prefix_store, rank, world_size, timeout)
 
+
+def _create_cuda_direct_pg_extended(dist_backend_opts, backend_options):
+    """Extended creator called by DeviceMesh / new_group in torch ≥ 2.10.
+
+    Receives a BackendConfig object with extra fields (group_id, global_ranks).
+    Falls back gracefully if those fields don't exist on older torch builds.
+    """
+    del backend_options
+    return ProcessGroupCudaDirect(
+        dist_backend_opts.store,
+        dist_backend_opts.group_rank,
+        dist_backend_opts.group_size,
+        dist_backend_opts.timeout,
+        group_id=getattr(dist_backend_opts, "group_id", None),
+        global_ranks_in_group=list(getattr(dist_backend_opts, "global_ranks_in_group", []) or []),
+    )
+
+
 def register_backend():
     import os
     if os.name != "nt":
@@ -515,3 +572,14 @@ def register_backend():
         dist.Backend.register_backend("cuda_direct", _create_cuda_direct_pg, devices=["cuda"])
     except RuntimeError:
         pass  # already registered, harmless
+    # Also register the extended creator used by DeviceMesh in torch ≥ 2.10.
+    # If this API doesn't exist on older torch the except swallows it cleanly.
+    try:
+        dist.Backend.register_backend(
+            "cuda_direct",
+            _create_cuda_direct_pg_extended,
+            extended_api=True,
+            devices=["cuda"],
+        )
+    except (RuntimeError, TypeError):
+        pass
