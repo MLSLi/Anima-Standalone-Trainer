@@ -26,7 +26,7 @@ function execWindowsPowerShellSync(script, options = {}) {
         if (fs.existsSync(pkgPath)) {
             console.log('[setup] Installing cuda_direct_backend...');
             try {
-                execWindowsPowerShellSync(`pip install --no-deps -e "${pkgPath}"`, { stdio: 'pipe' });
+                execWindowsPowerShellSync(`python -m pip install --no-deps -e "${pkgPath}"`, { stdio: 'pipe' });
                 console.log('[setup] cuda_direct_backend installed.\n');
             } catch {
                 console.warn('[setup] Could not install cuda_direct_backend. Multi-GPU cuda_direct will be unavailable.\n');
