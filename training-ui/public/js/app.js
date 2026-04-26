@@ -2624,10 +2624,8 @@ function updateCudaDirectForTpSp() {
   const cudaToggle = $("cfg-use-cuda-direct");
   if (!cudaGroup || !cudaToggle) return;
 
-  const mode      = $("cfg-multigpu-mode")?.value;
-  const tpBackend = $("cfg-tp-backend")?.value;
-  const spChecked = !!$("cfg-sequence-parallel")?.checked;
-  const isTpSp    = mode === "tp_sp" || tpBackend === "tp_sp" || spChecked;
+  const mode   = $("cfg-multigpu-mode")?.value;
+  const isTpSp = mode === "tp_sp";
 
   cudaGroup.classList.toggle("disabled-section", isTpSp);
   cudaToggle.disabled = isTpSp;
