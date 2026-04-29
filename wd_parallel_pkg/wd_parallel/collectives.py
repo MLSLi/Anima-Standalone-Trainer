@@ -38,7 +38,6 @@ copy).
 """
 
 import time
-from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -110,20 +109,6 @@ class GlobalMemoryBuffer:
 _memory_buffer = GlobalMemoryBuffer()
 
 
-@dataclass
-class PendingCollective:
-    """A launched collective whose output tensor becomes valid after ``wait()``."""
-
-    tensor: torch.Tensor
-    work: object | None = None
-
-    def wait(self) -> torch.Tensor:
-        if self.work is not None:
-            self.work.wait()
-            self.work = None
-        return self.tensor
-
-
 # ---------------------------------------------------------------------------
 # Low-level primitives
 # ---------------------------------------------------------------------------
@@ -143,26 +128,6 @@ def _maybe_time_collective(input_: torch.Tensor, fn):
     _maybe_cuda_sync(input_)
     comm_timer._record((time.perf_counter() - t0) * 1e3)
 
-
-def _launch_collective_async(input_: torch.Tensor, launch_fn):
-    if not comm_timer.enabled:
-        return launch_fn()
-    _maybe_cuda_sync(input_)
-    t0 = time.perf_counter()
-    work = launch_fn()
-
-    class _TimedWork:
-        def __init__(self, work_handle, input_tensor, start_time):
-            self._work = work_handle
-            self._input = input_tensor
-            self._start = start_time
-
-        def wait(self):
-            self._work.wait()
-            _maybe_cuda_sync(self._input)
-            comm_timer._record((time.perf_counter() - self._start) * 1e3)
-
-    return _TimedWork(work, input_, t0)
 
 def _gather_along_first_dim(
     input_: torch.Tensor,
@@ -455,54 +420,6 @@ class _GatherFromSPRegion(torch.autograd.Function):
         return (result, None, None)   # group, seq_dim need no gradient
 
 
-class _GatherFromSPRegionAsync(torch.autograd.Function):
-    """Async forward gather with the same backward as _GatherFromSPRegion."""
-
-    _pending_work: dict[int, object] = {}
-
-    @staticmethod
-    def forward(ctx, input_, group, seq_dim):
-        ctx.group = group
-        ctx.seq_dim = seq_dim
-        ctx.input_dtype = input_.dtype
-        world_size = group.size()
-        if world_size == 1:
-            result = input_.clone()
-            _GatherFromSPRegionAsync._pending_work[id(result)] = None
-            return result
-
-        if seq_dim == 0:
-            out_shape = (input_.size(0) * world_size,) + input_.shape[1:]
-            output = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
-            work = _launch_collective_async(
-                input_,
-                lambda: dist.all_gather_into_tensor(output, input_.contiguous(), group=group, async_op=True),
-            )
-            result = output
-        else:
-            x0 = input_.transpose(0, seq_dim).contiguous()
-            out_shape = (x0.size(0) * world_size,) + x0.shape[1:]
-            output0 = torch.empty(out_shape, dtype=x0.dtype, device=x0.device)
-            work = _launch_collective_async(
-                x0,
-                lambda: dist.all_gather_into_tensor(output0, x0, group=group, async_op=True),
-            )
-            result = output0.transpose(0, seq_dim).contiguous()
-
-        _GatherFromSPRegionAsync._pending_work[id(result)] = work
-        return result
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        if grad_output.dtype != ctx.input_dtype:
-            grad_output = grad_output.to(ctx.input_dtype)
-        result = _reduce_scatter_along_dim(
-            grad_output, ctx.group, ctx.seq_dim, buf_name="bwd_reduce_scatter"
-        )
-        _maybe_report_nan("GatherAsyncBwd(reduce_scatter)", grad_output, result)
-        return (result, None, None)
-
-
 class _ReduceScatterToSPRegion(torch.autograd.Function):
     """
     Forward:  reduce-scatter along seq_dim (TP region → SP region)
@@ -573,17 +490,6 @@ def gather_from_sp_region(
                  0 (default) → Megatron (S, B, D); 1 → batch-first (B, S, D).
     """
     return _GatherFromSPRegion.apply(x, group, seq_dim)
-
-
-def gather_from_sp_region_async(
-    x: torch.Tensor,
-    group: dist.ProcessGroup,
-    seq_dim: int = 0,
-) -> PendingCollective:
-    """Launch an async all-gather and return a handle that can be waited later."""
-    result = _GatherFromSPRegionAsync.apply(x, group, seq_dim)
-    work = _GatherFromSPRegionAsync._pending_work.pop(id(result), None)
-    return PendingCollective(result, work)
 
 
 def reduce_scatter_to_sp_region(

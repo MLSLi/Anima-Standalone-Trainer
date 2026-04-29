@@ -31,9 +31,7 @@ import torch.distributed as dist
 from typing import Optional
 
 from .collectives import (
-    PendingCollective,
     gather_from_sp_region,
-    gather_from_sp_region_async,
     reduce_scatter_to_sp_region,
     copy_to_tp_region,
     copy_to_tp_region_no_input_grad,
@@ -458,15 +456,6 @@ class ColumnParallelLinear(nn.Module):
                 return copy_to_tp_region(x, self._group)
         return x
 
-    def prepare_input_async(self, x: torch.Tensor) -> PendingCollective:
-        if (
-            self._group is not None
-            and self._group.size() > 1
-            and self.sequence_parallel
-        ):
-            return gather_from_sp_region_async(x, self._group, self.seq_dim)
-        return PendingCollective(self._prepare_tp_input(x))
-
     def forward_from_prepared_input(self, x: torch.Tensor) -> torch.Tensor:
         adapter = getattr(self, "_tp_lora_adapter", None)
         if adapter is not None:
@@ -474,7 +463,7 @@ class ColumnParallelLinear(nn.Module):
         return nn.functional.linear(x, self.weight, self.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_from_prepared_input(self.prepare_input_async(x).wait())
+        return self.forward_from_prepared_input(self._prepare_tp_input(x))
 
     def trim_full_output(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
         """Trim a full gathered output tensor back to original features."""

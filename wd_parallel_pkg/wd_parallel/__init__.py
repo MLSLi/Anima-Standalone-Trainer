@@ -39,9 +39,7 @@ from .config import ParallelConfig
 from .backends import activate_backend
 from .initialize import ProcessGroups, init_dist, destroy_dist
 from .collectives import (
-    PendingCollective,
     gather_from_sp_region,
-    gather_from_sp_region_async,
     reduce_scatter_to_sp_region,
     copy_to_tp_region,
     copy_to_tp_region_no_input_grad,
@@ -81,8 +79,7 @@ __all__ = [
     # Init
     "ProcessGroups", "init_dist", "destroy_dist",
     # Collectives
-    "PendingCollective",
-    "gather_from_sp_region", "gather_from_sp_region_async",
+    "gather_from_sp_region",
     "reduce_scatter_to_sp_region", "copy_to_tp_region",
     "copy_to_tp_region_no_input_grad",
     "comm_timer", "GlobalMemoryBuffer", "reset_nan_diagnostics",

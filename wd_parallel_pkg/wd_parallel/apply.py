@@ -56,11 +56,11 @@ class ColumnParallelSpec:
                        0 (default) → Megatron-style (S, B, D)
                        1           → batch-first    (B, S, D)  ← Anima, HuggingFace
     """
-    sequence_parallel: bool = True
-    seq_dim:           int  = 0
-    packed_parts:      Optional[int] = None
-    allow_padding:     bool = False
-    padding_multiple:  int  = 1
+    sequence_parallel:  bool = True
+    seq_dim:            int  = 0
+    packed_parts:       Optional[int] = None
+    allow_padding:      bool = False
+    padding_multiple:   int  = 1
 
 
 @dataclass
