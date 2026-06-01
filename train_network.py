@@ -879,6 +879,15 @@ class NetworkTrainer:
         train_text_encoder = self.is_train_text_encoder(args)
         network.apply_to(text_encoder, unet, train_text_encoder, train_unet)
 
+        # ---- Triton acceleration (optional: adds 5 fused LoRA kernels) ----
+        try:
+            import triton_inject
+            network.to(accelerator.device)
+            triton_inject.inject(unet, network, rank=args.network_dim or 32, alpha=args.network_alpha or 16)
+            triton_inject.inject_rope_model(unet)  # fuse Q+K RoPE
+        except Exception:
+            pass  # fallback to standard LoRA if Triton injection fails
+
         if args.network_weights is not None:
             # FIXME consider alpha of weights: this assumes that the alpha is not changed
             info = network.load_weights(args.network_weights)
