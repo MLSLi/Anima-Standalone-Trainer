@@ -44,7 +44,7 @@ def benchmark(warmup_ms=50, rep_ms=200):
         t_tri = triton.testing.do_bench(
             lambda: fused(q, k, r[:N]), warmup=warmup_ms, rep=rep_ms)
 
-        print(f"{label:<20s} {t_ref*1e6:>11.0f}us {t_tri*1e6:>11.0f}us {t_ref/t_tri:>7.2f}x")
+        print(f"{label:<20s} {t_ref*1e3:>11.0f}us {t_tri*1e3:>11.0f}us {t_ref/t_tri:>7.2f}x")
 
     # Detailed stats for Anima 512²
     print(f"\n--- N=1024 (Anima 512²) detailed ---")
@@ -61,8 +61,8 @@ def benchmark(warmup_ms=50, rep_ms=200):
         all_m = triton.testing.do_bench(fn, warmup=50, rep=500, return_mode='all')
         m = torch.tensor(all_m)
         print(f"  {label}:")
-        print(f"    mean={m.mean()*1e6:.0f}us  median={m.median()*1e6:.0f}us  std={m.std()*1e6:.0f}us")
-        print(f"    n={len(all_m)}  P25={torch.quantile(m,0.25)*1e6:.0f}us  P75={torch.quantile(m,0.75)*1e6:.0f}us")
+        print(f"    mean={m.mean()*1e3:.0f}us  median={m.median()*1e3:.0f}us  std={m.std()*1e3:.0f}us")
+        print(f"    n={len(all_m)}  P25={torch.quantile(m,0.25)*1e3:.0f}us  P75={torch.quantile(m,0.75)*1e3:.0f}us")
 
 
 if __name__ == "__main__":

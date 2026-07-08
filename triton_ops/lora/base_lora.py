@@ -62,7 +62,7 @@ _AUTOTUNE_CONFIGS = [
 ]
 
 
-@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["total_rows", "in_features", "out_features"])
+@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["total_rows", "in_features", "out_features", "rank"])
 @triton.jit
 def _kernel(
     # Input buffers (bf16)
@@ -248,3 +248,50 @@ def fused(
         h = h_flat.reshape(total_rows, rank)
         return y, h
     return y, None
+
+
+class _FusedBaseLoRAFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, base_weight, base_bias, lora_a, lora_b, alpha: float, rank: int):
+        ctx.has_bias = base_bias is not None
+        bias = base_bias if base_bias is not None else x.new_empty(0)
+        ctx.save_for_backward(x, base_weight, bias, lora_a, lora_b)
+        ctx.alpha = alpha
+        ctx.rank = rank
+        return fused(x, base_weight, base_bias, lora_a, lora_b, alpha=alpha, rank=rank)[0]
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, base_weight, bias, lora_a, lora_b = ctx.saved_tensors
+        base_bias = bias if ctx.has_bias else None
+        with torch.enable_grad():
+            x_r = x.detach().requires_grad_(ctx.needs_input_grad[0])
+            bw_r = base_weight.detach().requires_grad_(ctx.needs_input_grad[1])
+            bb_r = base_bias.detach().requires_grad_(ctx.needs_input_grad[2]) if base_bias is not None else None
+            la_r = lora_a.detach().requires_grad_(ctx.needs_input_grad[3])
+            lb_r = lora_b.detach().requires_grad_(ctx.needs_input_grad[4])
+            y = reference(x_r, bw_r, bb_r, la_r, lb_r, alpha=ctx.alpha, rank=ctx.rank)
+        grad_vars = tuple(v for v in (x_r, bw_r, bb_r, la_r, lb_r) if v is not None and v.requires_grad)
+        grad_inputs = torch.autograd.grad(y, grad_vars, grad_out, allow_unused=True)
+        grads = []
+        idx = 0
+        for v in (x_r, bw_r, bb_r, la_r, lb_r):
+            if v is None or not v.requires_grad:
+                grads.append(None)
+            else:
+                grads.append(grad_inputs[idx])
+                idx += 1
+        return (*grads, None, None)
+
+
+def fused_autograd(
+    x: torch.Tensor,
+    base_weight: torch.Tensor,
+    base_bias: Optional[torch.Tensor],
+    lora_a: torch.Tensor,
+    lora_b: torch.Tensor,
+    alpha: float = 16.0,
+    rank: int = 32,
+) -> torch.Tensor:
+    """Autograd-compatible forward: Triton forward, PyTorch recompute backward."""
+    return _FusedBaseLoRAFn.apply(x, base_weight, base_bias, lora_a, lora_b, alpha, rank)

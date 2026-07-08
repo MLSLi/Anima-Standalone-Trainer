@@ -11,6 +11,10 @@ import triton
 import triton.language as tl
 
 
+_ROPE_CACHE: dict[tuple[int, str, torch.dtype, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]] = {}
+_ROPE_CACHE_MAX_ENTRIES = 8
+
+
 # ============================================================================
 # PyTorch reference — matches model's _apply_rotary_pos_emb_base exactly
 # ============================================================================
@@ -111,6 +115,27 @@ def _fused_rope_kernel(
 # Public API
 # ============================================================================
 
+def _cached_cos_sin(rope_emb: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    freqs = rope_emb.squeeze(1).squeeze(1)
+    key = (freqs.data_ptr(), str(freqs.device), dtype, tuple(freqs.shape))
+    cached = _ROPE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if len(_ROPE_CACHE) >= _ROPE_CACHE_MAX_ENTRIES:
+        _ROPE_CACHE.pop(next(iter(_ROPE_CACHE)))
+
+    cos_val = torch.cos(freqs).to(dtype=dtype).contiguous()
+    sin_val = torch.sin(freqs).to(dtype=dtype).contiguous()
+    _ROPE_CACHE[key] = (cos_val, sin_val)
+    return cos_val, sin_val
+
+
+def clear_rope_cache() -> None:
+    """Drop cached cos/sin tensors held by this module."""
+    _ROPE_CACHE.clear()
+
+
 def fused(q, k, cos, sin=None):
     """Fused Anima RoPE for Q and K.
 
@@ -119,9 +144,7 @@ def fused(q, k, cos, sin=None):
     sin:   optional — if None, cos is rope_emb and sin is auto-computed
     """
     if sin is None:
-        freqs = cos.squeeze(1).squeeze(1)  # [N, 1, 1, D] → [N, D]
-        cos_val = torch.cos(freqs).to(dtype=q.dtype)
-        sin_val = torch.sin(freqs).to(dtype=q.dtype)
+        cos_val, sin_val = _cached_cos_sin(cos, q.dtype)
     else:
         cos_val = cos; sin_val = sin
 

@@ -61,7 +61,7 @@ _AUTOTUNE_CONFIGS = [
 ]
 
 
-@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["total_rows", "in_features", "out_features"])
+@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["total_rows", "in_features", "out_features", "rank"])
 @triton.jit
 def _kernel(
     x_ptr,

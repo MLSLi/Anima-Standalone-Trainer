@@ -135,6 +135,70 @@ def _kernel(
         tl.store(out_ptr + row_offset + c_offs, y.to(tl.bfloat16), mask=c_mask)
 
 
+@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["features"])
+@triton.jit
+def _kernel_two_pass(
+    x_ptr,
+    scale_ptr,
+    shift_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    mean_ptr,
+    rstd_ptr,
+    total_rows,
+    features,
+    eps: tl.constexpr,
+    stride_row,
+    BLOCK_C: tl.constexpr,
+):
+    """Per-row AdaLN + LayerNorm with sum/sumsq statistics."""
+    row_idx = tl.program_id(0)
+    if row_idx >= total_rows:
+        return
+
+    row_offset = row_idx * stride_row
+    acc_sum = tl.zeros([], dtype=tl.float32)
+    acc_sum_sq = tl.zeros([], dtype=tl.float32)
+    acc_count = tl.zeros([], dtype=tl.float32)
+
+    for c_start in range(0, features, BLOCK_C):
+        c_offs = c_start + tl.arange(0, BLOCK_C)
+        c_mask = c_offs < features
+
+        x_val = tl.load(x_ptr + row_offset + c_offs, mask=c_mask, other=0.0).to(tl.float32)
+        s_val = tl.load(scale_ptr + c_offs, mask=c_mask, other=0.0).to(tl.float32)
+        sh_val = tl.load(shift_ptr + c_offs, mask=c_mask, other=0.0).to(tl.float32)
+
+        x_mod = x_val * s_val + sh_val
+        x_masked = tl.where(c_mask, x_mod, 0.0)
+        acc_sum += tl.sum(x_masked)
+        acc_sum_sq += tl.sum(x_masked * x_masked)
+        acc_count += tl.sum(c_mask.to(tl.float32))
+
+    mean = acc_sum / acc_count
+    var = tl.maximum(acc_sum_sq / acc_count - mean * mean, 0.0)
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    if mean_ptr is not None:
+        tl.store(mean_ptr + row_idx, mean)
+        tl.store(rstd_ptr + row_idx, rstd)
+
+    for c_start in range(0, features, BLOCK_C):
+        c_offs = c_start + tl.arange(0, BLOCK_C)
+        c_mask = c_offs < features
+
+        x_val = tl.load(x_ptr + row_offset + c_offs, mask=c_mask, other=0.0).to(tl.float32)
+        s_val = tl.load(scale_ptr + c_offs, mask=c_mask, other=0.0).to(tl.float32)
+        sh_val = tl.load(shift_ptr + c_offs, mask=c_mask, other=0.0).to(tl.float32)
+        w_val = tl.load(weight_ptr + c_offs, mask=c_mask, other=0.0).to(tl.float32)
+        b_val = tl.load(bias_ptr + c_offs, mask=c_mask, other=0.0).to(tl.float32)
+
+        x_mod = x_val * s_val + sh_val
+        y = (x_mod - mean) * rstd * w_val + b_val
+        tl.store(out_ptr + row_offset + c_offs, y.to(tl.bfloat16), mask=c_mask)
+
+
 # ============================================================================
 # Public API
 # ============================================================================
@@ -197,3 +261,179 @@ def fused(
     if save_stats:
         return y, mean_out.reshape(total_rows), rstd_out.reshape(total_rows)
     return y, None, None
+
+
+def fused_two_pass(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float = 1e-6,
+    save_stats: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Two-pass AdaLN using sum/sumsq statistics.
+
+    This reads ``x/scale/shift`` twice instead of three times.  It is faster
+    but can differ slightly from the three-pass variance calculation.
+    """
+    *batch_dims, features = x.shape
+    total_rows = 1
+    for d in batch_dims:
+        total_rows *= d
+
+    x_flat = x.reshape(total_rows, features).contiguous()
+    out_flat = torch.empty(total_rows, features, dtype=torch.bfloat16, device=x.device)
+
+    mean_out = (
+        torch.empty(total_rows, dtype=torch.float32, device=x.device)
+        if save_stats
+        else x.new_empty(1)
+    )
+    rstd_out = (
+        torch.empty(total_rows, dtype=torch.float32, device=x.device)
+        if save_stats
+        else x.new_empty(1)
+    )
+
+    _kernel_two_pass[(total_rows,)](
+        x_flat,
+        scale, shift, weight, bias,
+        out_flat,
+        mean_out if save_stats else None,
+        rstd_out if save_stats else None,
+        total_rows,
+        features,
+        eps,
+        x_flat.stride(0),
+    )
+
+    y = out_flat.reshape(*batch_dims, features)
+    if save_stats:
+        return y, mean_out.reshape(total_rows), rstd_out.reshape(total_rows)
+    return y, None, None
+
+
+@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["features"])
+@triton.jit
+def _kernel_anima_modulated(
+    x_ptr,
+    scale_ptr,
+    shift_ptr,
+    out_ptr,
+    total_rows,
+    features,
+    spatial_rows: tl.constexpr,
+    eps: tl.constexpr,
+    stride_row,
+    BLOCK_C: tl.constexpr,
+):
+    """Anima AdaLN: ``LayerNorm(x) * (1 + scale) + shift``."""
+    row_idx = tl.program_id(0)
+    if row_idx >= total_rows:
+        return
+
+    row_offset = row_idx * stride_row
+    mod_row = row_idx // spatial_rows
+    mod_offset = mod_row * features
+
+    acc_sum = tl.zeros([], dtype=tl.float32)
+    acc_sum_sq = tl.zeros([], dtype=tl.float32)
+    acc_count = tl.zeros([], dtype=tl.float32)
+
+    for c_start in range(0, features, BLOCK_C):
+        c_offs = c_start + tl.arange(0, BLOCK_C)
+        c_mask = c_offs < features
+        x_val = tl.load(x_ptr + row_offset + c_offs, mask=c_mask, other=0.0).to(tl.float32)
+        x_masked = tl.where(c_mask, x_val, 0.0)
+        acc_sum += tl.sum(x_masked)
+        acc_sum_sq += tl.sum(x_masked * x_masked)
+        acc_count += tl.sum(c_mask.to(tl.float32))
+
+    mean = acc_sum / acc_count
+    var = tl.maximum(acc_sum_sq / acc_count - mean * mean, 0.0)
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    for c_start in range(0, features, BLOCK_C):
+        c_offs = c_start + tl.arange(0, BLOCK_C)
+        c_mask = c_offs < features
+        x_val = tl.load(x_ptr + row_offset + c_offs, mask=c_mask, other=0.0).to(tl.float32)
+        s_val = tl.load(scale_ptr + mod_offset + c_offs, mask=c_mask, other=0.0).to(tl.float32)
+        sh_val = tl.load(shift_ptr + mod_offset + c_offs, mask=c_mask, other=0.0).to(tl.float32)
+        y = (x_val - mean) * rstd * (1.0 + s_val) + sh_val
+        tl.store(out_ptr + row_offset + c_offs, y.to(tl.bfloat16), mask=c_mask)
+
+
+def fused_anima_modulated(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fused Anima AdaLN for ``x [B,T,H,W,D]``.
+
+    ``scale`` and ``shift`` are broadcast tensors shaped ``[B,T,1,1,D]``
+    or equivalent contiguous ``[B,T,D]`` views.
+    """
+    B, T, H, W, features = x.shape
+    total_rows = B * T * H * W
+    spatial_rows = H * W
+
+    x_flat = x.reshape(total_rows, features).contiguous()
+    scale_flat = scale.reshape(B * T, features).contiguous()
+    shift_flat = shift.reshape(B * T, features).contiguous()
+    out_flat = torch.empty(total_rows, features, dtype=torch.bfloat16, device=x.device)
+
+    _kernel_anima_modulated[(total_rows,)](
+        x_flat,
+        scale_flat,
+        shift_flat,
+        out_flat,
+        total_rows,
+        features,
+        spatial_rows=spatial_rows,
+        eps=eps,
+        stride_row=x_flat.stride(0),
+    )
+    return out_flat.reshape(B, T, H, W, features)
+
+
+class _FusedAnimaAdaLNFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale, shift, eps: float):
+        ctx.save_for_backward(x, scale, shift)
+        ctx.eps = eps
+        return fused_anima_modulated(x, scale, shift, eps)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, scale, shift = ctx.saved_tensors
+        with torch.enable_grad():
+            x_r = x.detach().requires_grad_(ctx.needs_input_grad[0])
+            scale_r = scale.detach().requires_grad_(ctx.needs_input_grad[1])
+            shift_r = shift.detach().requires_grad_(ctx.needs_input_grad[2])
+            y = torch.nn.functional.layer_norm(
+                x_r, (x_r.shape[-1],), None, None, ctx.eps
+            ) * (1 + scale_r) + shift_r
+        vars_all = (x_r, scale_r, shift_r)
+        grad_vars = tuple(v for v in vars_all if v.requires_grad)
+        grad_inputs = torch.autograd.grad(y, grad_vars, grad_out, allow_unused=True)
+        grads = []
+        idx = 0
+        for v in vars_all:
+            if not v.requires_grad:
+                grads.append(None)
+            else:
+                grads.append(grad_inputs[idx])
+                idx += 1
+        return (*grads, None)
+
+
+def fused_anima_modulated_autograd(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Autograd-compatible Anima AdaLN: Triton forward, PyTorch recompute backward."""
+    return _FusedAnimaAdaLNFn.apply(x, scale, shift, eps)

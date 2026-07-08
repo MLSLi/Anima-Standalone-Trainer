@@ -62,7 +62,7 @@ _AUTOTUNE_CONFIGS = [
 ]
 
 
-@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["total_rows", "features"])
+@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["total_rows", "features", "rank"])
 @triton.jit
 def _kernel(
     x_ptr,
@@ -76,6 +76,7 @@ def _kernel(
     rank: tl.constexpr,
     stride_x_0,
     stride_base_0,
+    stride_out_0,
     stride_la_0,
     stride_lb_0,
     BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_C: tl.constexpr,
@@ -130,9 +131,9 @@ def _kernel(
         bq_base = base_q_ptr + row_offs[:, None] * stride_base_0
         bk_base = base_k_ptr + row_offs[:, None] * stride_base_0
         bv_base = base_v_ptr + row_offs[:, None] * stride_base_0
-        oq_base = out_q_ptr + row_offs[:, None] * stride_base_0
-        ok_base = out_k_ptr + row_offs[:, None] * stride_base_0
-        ov_base = out_v_ptr + row_offs[:, None] * stride_base_0
+        oq_base = out_q_ptr + row_offs[:, None] * stride_out_0
+        ok_base = out_k_ptr + row_offs[:, None] * stride_out_0
+        ov_base = out_v_ptr + row_offs[:, None] * stride_out_0
 
         for c_start in range(0, features, BLOCK_C):
             c_offs = c_start + tl.arange(0, BLOCK_C)
@@ -217,6 +218,7 @@ def fused(
         rank=rank,
         stride_x_0=x_flat.stride(0),
         stride_base_0=base_q.stride(0),
+        stride_out_0=out_q.stride(0),
         stride_la_0=lora_a_q.stride(0),
         stride_lb_0=lora_b_q.stride(0),
     )
@@ -224,3 +226,124 @@ def fused(
     return (out_q.reshape(*batch_dims, features),
             out_k.reshape(*batch_dims, features),
             out_v.reshape(*batch_dims, features))
+
+
+def fused_packed(
+    x: torch.Tensor,
+    base_w_qkv: torch.Tensor,
+    base_b_qkv: Optional[torch.Tensor],
+    lora_a_q: torch.Tensor, lora_a_k: torch.Tensor, lora_a_v: torch.Tensor,
+    lora_b_q: torch.Tensor, lora_b_k: torch.Tensor, lora_b_v: torch.Tensor,
+    alpha: float = 16.0,
+    rank: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused Q/K/V LoRA with one packed cuDNN base projection.
+
+    ``base_w_qkv`` is ``torch.cat([Wq, Wk, Wv], dim=0)`` and
+    ``base_b_qkv`` is the matching concatenated bias, or ``None``.
+    """
+    *batch_dims, features = x.shape
+    total_rows = 1
+    for d in batch_dims:
+        total_rows *= d
+
+    lora_scale = alpha / rank
+    x_flat = x.reshape(total_rows, features).contiguous()
+
+    base_qkv = torch.nn.functional.linear(x_flat, base_w_qkv, base_b_qkv)
+    base_q, base_k, base_v = base_qkv.split(features, dim=1)
+
+    out_q = torch.empty(total_rows, features, dtype=torch.bfloat16, device=x.device)
+    out_k = torch.empty(total_rows, features, dtype=torch.bfloat16, device=x.device)
+    out_v = torch.empty(total_rows, features, dtype=torch.bfloat16, device=x.device)
+
+    grid = lambda meta: (min(triton.cdiv(total_rows, meta["BLOCK_M"]), MAX_GRID_SIZE),)
+    _kernel[grid](
+        x_flat,
+        base_q, base_k, base_v,
+        lora_a_q.contiguous(), lora_a_k.contiguous(), lora_a_v.contiguous(),
+        lora_b_q.contiguous(), lora_b_k.contiguous(), lora_b_v.contiguous(),
+        out_q, out_k, out_v,
+        lora_scale=lora_scale,
+        total_rows=total_rows,
+        features=features,
+        rank=rank,
+        stride_x_0=x_flat.stride(0),
+        stride_base_0=base_q.stride(0),
+        stride_out_0=out_q.stride(0),
+        stride_la_0=lora_a_q.stride(0),
+        stride_lb_0=lora_b_q.stride(0),
+    )
+
+    return (out_q.reshape(*batch_dims, features),
+            out_k.reshape(*batch_dims, features),
+            out_v.reshape(*batch_dims, features))
+
+
+class _FusedPackedQKVFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, base_w_qkv, base_b_qkv, la_q, la_k, la_v, lb_q, lb_k, lb_v, alpha: float, rank: int):
+        ctx.has_bias = base_b_qkv is not None
+        bias = base_b_qkv if base_b_qkv is not None else x.new_empty(0)
+        ctx.save_for_backward(x, base_w_qkv, bias, la_q, la_k, la_v, lb_q, lb_k, lb_v)
+        ctx.alpha = alpha
+        ctx.rank = rank
+        return fused_packed(x, base_w_qkv, base_b_qkv, la_q, la_k, la_v, lb_q, lb_k, lb_v, alpha=alpha, rank=rank)
+
+    @staticmethod
+    def backward(ctx, grad_q, grad_k, grad_v):
+        x, base_w_qkv, bias, la_q, la_k, la_v, lb_q, lb_k, lb_v = ctx.saved_tensors
+        base_b_qkv = bias if ctx.has_bias else None
+        features = x.shape[-1]
+        with torch.enable_grad():
+            x_r = x.detach().requires_grad_(ctx.needs_input_grad[0])
+            bw_r = base_w_qkv.detach().requires_grad_(ctx.needs_input_grad[1])
+            bb_r = base_b_qkv.detach().requires_grad_(ctx.needs_input_grad[2]) if base_b_qkv is not None else None
+            laq_r = la_q.detach().requires_grad_(ctx.needs_input_grad[3])
+            lak_r = la_k.detach().requires_grad_(ctx.needs_input_grad[4])
+            lav_r = la_v.detach().requires_grad_(ctx.needs_input_grad[5])
+            lbq_r = lb_q.detach().requires_grad_(ctx.needs_input_grad[6])
+            lbk_r = lb_k.detach().requires_grad_(ctx.needs_input_grad[7])
+            lbv_r = lb_v.detach().requires_grad_(ctx.needs_input_grad[8])
+            bw_q, bw_k, bw_v = bw_r.split(features, dim=0)
+            if bb_r is None:
+                bb_q = bb_k = bb_v = None
+            else:
+                bb_q, bb_k, bb_v = bb_r.split(features, dim=0)
+            outputs = reference(
+                x_r, bw_q, bw_k, bw_v, bb_q, bb_k, bb_v,
+                laq_r, lak_r, lav_r, lbq_r, lbk_r, lbv_r,
+                alpha=ctx.alpha, rank=ctx.rank,
+            )
+        inputs = tuple(
+            v for v in (x_r, bw_r, bb_r, laq_r, lak_r, lav_r, lbq_r, lbk_r, lbv_r)
+            if v is not None and v.requires_grad
+        )
+        grad_inputs = torch.autograd.grad(outputs, inputs, (grad_q, grad_k, grad_v), allow_unused=True)
+        grads = []
+        idx = 0
+        for v in (x_r, bw_r, bb_r, laq_r, lak_r, lav_r, lbq_r, lbk_r, lbv_r):
+            if v is None or not v.requires_grad:
+                grads.append(None)
+            else:
+                grads.append(grad_inputs[idx])
+                idx += 1
+        return (*grads, None, None)
+
+
+def fused_packed_autograd(
+    x: torch.Tensor,
+    base_w_qkv: torch.Tensor,
+    base_b_qkv: Optional[torch.Tensor],
+    lora_a_q: torch.Tensor, lora_a_k: torch.Tensor, lora_a_v: torch.Tensor,
+    lora_b_q: torch.Tensor, lora_b_k: torch.Tensor, lora_b_v: torch.Tensor,
+    alpha: float = 16.0,
+    rank: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Autograd-compatible packed QKV: Triton forward, PyTorch recompute backward."""
+    return _FusedPackedQKVFn.apply(
+        x, base_w_qkv, base_b_qkv,
+        lora_a_q, lora_a_k, lora_a_v,
+        lora_b_q, lora_b_k, lora_b_v,
+        alpha, rank,
+    )
