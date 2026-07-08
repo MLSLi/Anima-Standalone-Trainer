@@ -57,12 +57,20 @@ def load_anima_dit(
     else:
         state_dict = load_file(dit_path, device="cpu")
 
-    # Remove 'net.' prefix if present
+    # Normalize checkpoint prefixes
+    prefixes = (
+        "net.",
+        "model.diffusion_model.",
+    )
+
     new_state_dict = {}
     for k, v in state_dict.items():
-        if k.startswith('net.'):
-            k = k[len('net.'):]
+        for prefix in prefixes:
+            if k.startswith(prefix):
+                k = k[len(prefix):]
+                break
         new_state_dict[k] = v
+
     state_dict = new_state_dict
 
     # Derive config from state_dict
